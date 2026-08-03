@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -547,37 +548,82 @@ class MaskApp:
 
     def _import_lex_txt(self) -> None:
         p = filedialog.askopenfilename(
-            title="导入词库（TXT，每行一个词）",
+            title="导入词库（TXT，每行一个词，可带类别前缀）",
             initialdir=self._initial_dir(),
             filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
         )
         if not p:
             return
         try:
-            data = Path(p).read_text(encoding="utf-8", errors="ignore")
+            data = Path(p).read_text(encoding="utf-8-sig", errors="ignore")
         except OSError as exc:
             messagebox.showerror("读取失败", f"无法读取文件：\n{exc}")
             return
-        words = self._split_words(data)
-        if not words:
+        parsed = self._parse_lex_txt(data)
+        if not parsed:
             messagebox.showinfo("提示", "文件中没有可导入的词。")
             return
-        cat = self._lex_cat_key()
         current = self.cfg.setdefault("user_lexicon", {})
-        existing = list(current.get(cat, []))
-        added = 0
-        for w in words:
-            if w not in existing:
-                existing.append(w)
-                added += 1
-        if added:
-            current[cat] = existing
+        total_added = 0
+        cat_labels = {k: lbl for lbl, k in LEX_CATEGORIES}
+        summary = []
+        for cat, words in parsed.items():
+            existing = list(current.get(cat, []))
+            before = len(existing)
+            for w in words:
+                if w not in existing:
+                    existing.append(w)
+            added = len(existing) - before
+            if added:
+                current[cat] = existing
+                total_added += added
+                summary.append(f"「{cat_labels.get(cat, cat)}」+{added}")
+        if total_added:
             settings.save(self.cfg)
             self._refresh_lex_list()
         messagebox.showinfo(
             "导入完成",
-            f"已导入 {added} 个新词到「{self.var_lex_cat.get()}」（当前共 {len(existing)} 个）。",
+            f"已导入 {total_added} 个新词：\n" + "；".join(summary),
         )
+
+    def _parse_lex_txt(self, text: str) -> dict[str, list[str]]:
+        """解析 TXT 词库文件，返回 {类别 key: [词...]}。
+
+        规则：
+          · 以 ``#`` 或 ``//`` 开头的行是注释，忽略；
+          · 行内可带类别前缀（公司名 / 人名 / 项目名 / 机构 / 单位 /
+            地名 / 金额 / 自定义，或英文 company / person / ...），
+            前缀后接中文冒号 ``：`` 或英文冒号 ``:``，再写词；
+          · 没有前缀的行，归入界面下拉框「当前选中的类别」；
+          · 同一行可用 逗号、顿号、分号、制表符 分隔多个词，
+            也可以一行一个词。
+        """
+        label_to_key = {lbl: k for lbl, k in LEX_CATEGORIES}
+        default_cat = self._lex_cat_key()
+        result: dict[str, list[str]] = {}
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith("//"):
+                continue
+            m = re.match(r"^([\u4e00-\u9fffA-Za-z_/ ]+?)[：:]\s*(.*)$", line)
+            if m:
+                prefix = m.group(1).strip()
+                rest = m.group(2).strip()
+                cat = label_to_key.get(prefix) or (
+                    prefix.lower() if prefix.lower() in label_to_key.values() else None
+                )
+                if cat is None:
+                    # 前缀不匹配任何类别，整行作为词归入默认类别
+                    words = self._split_words(line)
+                    cat = default_cat
+                else:
+                    words = self._split_words(rest) if rest else []
+            else:
+                cat = default_cat
+                words = self._split_words(line)
+            if words:
+                result.setdefault(cat, []).extend(words)
+        return result
 
     def _remove_lex_selected(self) -> None:
         sel = self.lst_lex.curselection()
