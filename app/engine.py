@@ -232,105 +232,312 @@ _SMART_THR: dict[str, float] = dict(SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT]["thr
 
 
 # --------------------------------------------------------------------------
-# NER 误报抑制层（smart / aggressive 模式统一生效，与灵敏度档位无关）
+# 自主识别层（构词法 + 上下文驱动，不依赖实体词库 / 映射表）
 # --------------------------------------------------------------------------
-# jieba NER 在技术规范书 / 合同这类文档里会把大量普通词语误标为实体
-# （如「网络安全」「买卖双方」「根据」「日志」「深度」…）。这些词无论把
-# 灵敏度调到多低都无法靠阈值区分（真实机构名与误报置信度高度重叠），
-# 因此这里在策略层做「强制不脱敏」与「按实体类型校验」两件事：
-#   1) 精确白名单：已知的高频误报词，直接不脱敏；
-#   2) 类型校验：
-#        · person  —— 仅接受 2~3 字且首字为常见姓氏的疑似姓名；
-#        · location—— 仅接受以地名后缀（省/市/区/县/路/…/国）结尾的词，
-#                       裸的「中国/北京」等过于泛化、非敏感，不脱敏；
-#        · company —— 不强制后缀（华为/腾讯/中国联通 等无标准后缀），
-#                       靠白名单兜住明显非公司的动词短语；
-#        · custom  —— 交给白名单 + 灵敏度阈值。
-# 注：此层只针对 NER（含 unknown 来源）。正则/词库项不受此影响，
-# 高置信正则（手机/邮箱/金额/IP/日期/真实项目名）照常脱敏。
+# 设计原则：不去「记住」哪些公司、项目、人名是敏感的——那需要无穷无尽的词库，
+# 换一份文档就失效。改为利用中文专名的「构词法」与「上下文位置」自主判断：
+#
+#   1) 组织机构名 = [专名 / 字号] + [行业属性] + [组织形式后缀]
+#      「组织形式后缀」（有限公司 / 集团 / 研究院 / 管理局 / 人民政府 …）是
+#      汉语机构命名法的闭集，属语言规则而非实体清单。只要以其收尾且前缀合法，
+#      无论这家单位此前是否见过都能识别 —— 「中电信数智科技有限公司」这类
+#      全新机构无需任何词库即可命中，且能拿到完整名称（不会被 NER 截断）。
+#
+#   2) 地址 = 行政区划链（省 / 市 / 区 / 县）+ 街路巷号 / 园区 / 大厦
+#
+#   3) 人名 = 姓氏（汉语姓氏闭集）+ 1~2 字名；或由「联系人 / 负责人 / 签字」
+#      等结构化标签、职务称谓等上下文触发。
+#
+#   4) 项目名 = [限定修饰] + [项目类中心词]（项目 / 工程 / 标段 / 子系统 …），
+#      中心词分强弱：强中心词（项目 / 工程 / 标段）可直接认定；弱中心词
+#      （系统 / 平台 / 网络）过于泛用，须有足够长的专名修饰或处在标题行 /
+#      结构化字段中才认定，避免把「本系统」「开放平台」当成项目名。
+#
+#   5) 反向判据（取代「误报词黑名单」）：一个候选若在构词上不具备上述任何
+#      专名特征 —— 没有组织后缀、没有地名后缀、不是姓名结构、不含项目中心词
+#      —— 即判定为普通词组，一律不脱敏。于是「网络安全 / 买卖双方 / 根据 /
+#      日志 / 深度 / 加密 / 外联 / 中华民族 / 严格遵守」等无需逐个登记，
+#      也会被自动排除；反之新出现的普通词同样自动排除，不需要再维护词表。
+#
+# 下面这些常量都是「语素级构词规则」（后缀 / 前缀 / 虚词 / 姓氏），
+# 不是「实体映射库」——它们不记录任何一家具体公司、项目或人名。
 
-#: 高频误报词（被 jieba 误标为人名/地名/机构/专名，但绝非敏感信息）
-_NER_SUPPRESS: frozenset[str] = frozenset([
-    # —— 技术 / 抽象名词（常被误标为 custom / company / location）——
-    "网络安全", "信息安全", "网络威胁", "威胁感知", "资产安全", "系统安全",
-    "测试方法", "测试计划", "二次开发", "监督控制", "安全事件", "开放平台",
-    "环境中运行", "最新进展", "网络运营", "网络通信", "加密", "外联", "日志",
-    "深度", "云化", "长度", "维度", "之日起", "中文", "汉字", "应予以",
-    "相应", "如下", "以下", "相关要求", "本系统", "本项目", "该工程",
-    "本合同", "本规范", "本文件", "本条款", "本工程",
-    # —— 合同 / 招投标高频角色词（常被误标为 person / company）——
-    "建设单位", "设计单位", "监理单位", "施工单位", "供货商", "供应商",
-    "投标人", "中标人", "发包人", "承包人", "甲方", "乙方", "丙方",
-    "相关方", "第三方", "各参与方", "买卖双方",
-    # —— 曾被实际误标的普通词 ——
-    "根据", "明白", "安全性", "保驾护航", "许可", "严格遵守", "中华民族",
-    "新建", "提出", "确保", "针对", "卖方", "买方", "双方", "各方",
-    # 「联通」是 jieba NER 的易误标词：在「外联」「互联」等含「联」的词里
-    # 会被误判为「联通」（中国联通）并触发子串合并，把「外联」错改成
-    # 「外[…]道」。完整公司名「中国联通」由 company 检测正常脱敏，
-    # 故此处抑制孤立的「联通」，避免误伤「外联」等词。
-    "联通",
-])
+#: 组织形式「强后缀」：出现即可判定为机构。
+#: 顺序要求：长后缀排在短后缀之前，保证正则交替时取到最长形式。
+_ORG_SUFFIX_STRONG: tuple[str, ...] = (
+    "股份有限责任公司", "股份有限公司", "有限责任公司", "集团有限公司",
+    "有限公司", "总公司", "分公司", "子公司", "公司",
+    "集团股份", "集团", "控股", "实业",
+    "人民政府", "人民法院", "人民检察院", "人民医院", "人民银行",
+    "管理委员会", "工作委员会", "委员会", "监督管理局", "管理局",
+    "科学院", "研究院", "设计院", "规划院", "医学院", "职业学院", "学院",
+    "研究所", "设计所", "事务所", "研究中心", "检测中心", "疾控中心",
+    "大学", "中学", "小学", "医院", "卫生院",
+    "银行", "支行", "分行", "信用社", "证券", "保险",
+    "协会", "学会", "商会", "基金会", "合作社", "联合会", "促进会",
+    "事业部", "办事处", "指挥部", "管理处", "监理站",
+    "党支部", "党委", "工会",
+)
 
-#: 常见中文姓氏（用于校验「人名」是否像真实姓名）
+#: 组织形式「弱后缀」：过于泛用（数据中心 / 生产车间…），
+#: 需要更长的专名前缀佐证才认定为机构。
+_ORG_SUFFIX_WEAK: tuple[str, ...] = (
+    "中心", "基地", "工厂", "电厂", "矿业", "农场", "林场",
+    "局", "厅", "处", "科", "室", "站", "所", "厂", "队", "园区",
+)
+
+#: 组织形式「中等后缀」：单独看过于泛用，需 >=4 字专名前缀佐证。
+#: 覆盖政府部门（…监督局 /…管理厅 /…执法总队）与各类中心 / 基地。
+_ORG_SUFFIX_MEDIUM: tuple[str, ...] = (
+    "办公室", "总队", "支队", "大队", "中心", "基地",
+    "局", "厅", "署", "园区",
+)
+
+#: 行政区划 / 地址构词后缀
+_GEO_SUFFIX: tuple[str, ...] = (
+    "特别行政区", "自治区", "自治州", "自治县",
+    "省", "市", "区", "县", "旗", "州",
+    "镇", "乡", "村", "街道", "社区",
+    "路", "街", "大道", "巷", "号", "栋", "幢", "楼", "室",
+    "软件园", "科技园", "工业园", "开发区", "高新区", "园区", "新区",
+    "大厦", "广场", "小区", "公寓",
+)
+
+#: 机构性构词前缀：以国名 / 行政层级起头的组合几乎必为机构
+#: （中国联通 / 国家电网 / 中央结算…），用于识别无标准后缀的机构简称。
+_ORG_HEAD: tuple[str, ...] = ("中国", "中华", "国家", "中央", "全国", "国务院")
+
+#: 抽象名词构词后缀——以此收尾的中文词是抽象概念，不可能是机构 / 地名 / 人名。
+#: 这是「语素级」规则而非实体黑名单：任何以「…性 / …度 / …化 / …族」收尾的词
+#: （安全性 / 深度 / 云化 / 中华民族 …）都会被自动排除，无需逐词登记。
+_ABSTRACT_TAIL: tuple[str, ...] = (
+    "思想", "精神", "文明", "传统", "方式", "方法", "过程", "状态", "水平",
+    "能力", "要求", "标准", "规范", "原则", "措施", "手段", "内容", "功能",
+    "性能", "指标", "范围", "条件", "环境", "基础", "核心", "特点", "优势",
+    "问题", "情况", "结果", "目标", "任务", "职责", "义务", "权利", "责任",
+    "性", "度", "化", "族", "观", "史", "学", "论", "说", "率", "量",
+    "力", "感", "式", "型", "法", "制", "义", "派", "风", "情",
+)
+
+#: 功能语素 / 虚词 / 动词起始——以此开头的片段是句子成分而非专名。
+#: 同样是构词规则（汉语虚词与高频谓词是闭集），不记录任何实体。
+_FUNC_HEAD: tuple[str, ...] = (
+    "根据", "按照", "依照", "遵照", "依据", "通过", "对于", "关于", "针对",
+    "鉴于", "为了", "由于", "如果", "虽然", "但是", "并且", "同时", "以及",
+    "或者", "以便", "从而", "因此", "所以", "凡是", "任何", "所有", "其他",
+    "提出", "进行", "完成", "实现", "采用", "使用", "要求", "需要", "负责",
+    "成立", "提交", "监督", "保证", "确保", "涉及", "包括", "参加", "开展",
+    "具备", "满足", "支持", "提供", "承担", "遵守", "执行", "落实", "加强",
+    "本", "该", "此", "其", "各", "这", "那", "上述", "下列", "有关", "相关",
+    "卖方", "买方", "双方", "各方", "甲方", "乙方", "丙方", "我方", "对方",
+)
+
+#: 项目类「强中心词」：以此收尾即可认定为项目 / 工程名
+_PROJECT_CORE_STRONG: tuple[str, ...] = (
+    "项目", "工程", "标段", "标包", "课题", "专项", "工程建设",
+)
+
+#: 项目类「弱中心词」：过于泛用，需长修饰或结构化上下文佐证
+_PROJECT_CORE_WEAK: tuple[str, ...] = (
+    "子系统", "系统", "平台", "网络", "基地", "中心",
+)
+
+#: 项目 / 工程名内部须出现的实体指示语素（区分真专名与「重要项目」这类泛指）
+_PROJECT_INDICATOR: tuple[str, ...] = (
+    "系统", "平台", "建设", "网络", "扩容", "改造", "升级", "服务", "软件",
+    "硬件", "中心", "体系", "能力", "研发", "基地", "方案", "应用", "采购",
+    "集成", "运维", "安防", "监控", "感知", "数据", "信息", "智能", "数字",
+    "网", "院", "厂", "站", "所", "线", "库", "实验室", "子系统",
+)
+
+#: 汉语单姓（闭集构词成分，非人名库——它不记录任何一个具体姓名）
 _SURNAMES: frozenset[str] = frozenset(
     "王李张刘陈杨黄赵周吴徐孙朱马胡郭林何高梁郑罗宋谢唐韩冯于董"
     "萧程曹袁邓许傅沈曾彭吕苏卢蒋蔡贾丁魏薛叶阎余潘杜戴夏钟汪田任"
     "姜范方石姚谭廖邹熊金陆郝孔白崔康毛邱秦江史顾侯邵孟龙万段雷钱"
     "汤尹黎易常武乔贺赖龚文庞樊兰殷颜鲁韦毕聂庄卓项祝霍骆包诸左"
+    "石戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁昌马苗凤花方俞任袁柳"
+    "酆鲍史唐费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元"
+    "卜顾孟平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪"
+    "舒屈项祝董梁杜阮蓝闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐邱骆高"
+    "夏蔡田樊胡凌霍虞万支柯昝管卢莫经房裘缪干解应宗丁宣贲邓郁单杭洪"
+    "包诸左石崔吉钮龚程嵇邢滑裴陆荣翁荀羊於惠甄曲家封芮羿储靳汲邴糜"
+    "松井段富巫乌焦巴弓牧隗山谷车侯宓蓬全郗班仰秋仲伊宫宁仇栾暴甘钭"
+    "厉戎祖武符刘景詹束龙叶幸司韶郜黎蓟薄印宿白怀蒲邰从鄂索咸籍赖卓"
+    "蔺屠蒙池乔阴鬱胥能苍双闻莘党翟谭贡劳逄姬申扶堵冉宰郦雍卻璩桑桂"
+    "濮牛寿通边扈燕冀郏浦尚农温别庄晏柴瞿阎充慕连茹习宦艾鱼容向古易"
+    "慎戈廖庾终暨居衡步都耿满弘匡国文寇广禄阙东欧殳沃利蔚越夔隆师巩"
+    "厍聂晁勾敖融冷訾辛阚那简饶空曾毋沙乜养鞠须丰巢关蒯相查后荆红游"
+    "竺权逯盖益桓公"
 )
 
-#: 地名后缀（命中才视为可疑地点，避免误伤泛化词）
-_LOC_SUFFIX: tuple[str, ...] = (
-    "省", "市", "区", "县", "路", "街", "巷", "号", "镇", "乡", "村",
-    "园区", "开发区", "新区", "国", "州", "岛", "平原", "高原", "盆地",
-)
+#: 汉语复姓
+_SURNAMES_DOUBLE: frozenset[str] = frozenset([
+    "欧阳", "太史", "端木", "上官", "司马", "东方", "独孤", "南宫", "万俟",
+    "闻人", "夏侯", "诸葛", "尉迟", "公羊", "赫连", "澹台", "皇甫", "宗政",
+    "濮阳", "公冶", "太叔", "申屠", "公孙", "慕容", "仲孙", "钟离", "长孙",
+    "宇文", "司徒", "鲜于", "司空", "闾丘", "子车", "亓官", "司寇", "巫马",
+    "公西", "颛孙", "壤驷", "公良", "漆雕", "乐正", "宰父", "谷梁", "拓跋",
+    "夹谷", "轩辕", "令狐", "段干", "百里", "呼延", "东郭", "南门", "羊舌",
+    "微生", "公户", "公玉", "公仪", "梁丘", "公仲", "公上", "公门", "公山",
+])
 
-#: 项目 / 工程名前缀里的「明显非专名」起始词（以此开头的不可能是项目名）
-_PROJECT_NON_STARTER: tuple[str, ...] = (
-    "根据", "按照", "通过", "对于", "关于", "针对", "确保", "卖方", "买方",
-    "双方", "各方", "该", "本", "此", "各", "这些", "那些", "提出", "进行",
-    "完成", "实现", "采用", "使用", "要求", "需要", "负责", "成立", "提交",
-    "监督", "保证", "涉及", "包括", "以及", "并且", "同时", "为了", "由于",
-    "如果", "当", "规范", "应用", "开发", "设计", "实施", "运行", "维护",
-    "管理", "测试", "验收", "参加", "确保",
-)
+#: 人口高频姓氏先验（约前 120 单姓 + 常见复姓）。
+#: 用于 NER 人名的「误报抑制」闸门：真实人名绝大多数以高频姓氏起头，
+#: 罕见姓氏的 NER 命中更可能是普通词（「明白」以「明」起头、「应予以」以
+#: 「应」起头）。这是统计先验而非实体库——目的是在高 precision 下抑制误报；
+#: 罕见姓氏的真实人名若出现于「联系人 / 负责人：」等标签后，仍由
+#: _looks_like_person_labeled（完整姓氏集）兜底命中，不会漏检。
+_SURNAMES_COMMON: frozenset[str] = frozenset(
+    "王李张刘陈杨黄赵周吴徐孙朱马胡郭林何高梁郑罗宋谢唐韩冯于董"
+    "萧程曹袁邓许傅沈曾彭吕苏卢蒋蔡贾丁魏薛叶阎余潘杜戴夏钟汪田任"
+    "姜范方石姚谭廖邹熊金陆郝孔白崔康毛邱秦江史顾侯邵孟龙万段雷钱"
+    "汤尹黎易常武乔贺赖龚文庞樊兰殷颜鲁韦毕聂庄卓项祝霍骆包诸左"
+    "石戚喻柏水窦章云葛奚郎昌苗凤花俞柳"
+).union(frozenset([
+    "欧阳", "司马", "上官", "诸葛", "东方", "独孤", "南宫", "慕容", "仲孙",
+    "皇甫", "夏侯", "尉迟", "公孙", "令狐", "宇文", "司徒", "长孙", "万俟",
+    "闻人", "端木",
+]))
 
-#: 项目 / 工程名内部必须出现的「实体指示词」（区分真专名与普通短语）
-#: 注意：不要包含「项目」「工程」本身，否则「示范项目」「本项目」
-#: 这类普通短语会借由指示词命中。必须出现一个真正名词才认可。
-_PROJECT_INDICATOR: tuple[str, ...] = (
-    "系统", "平台", "建设", "网络", "扩容", "服务", "软件", "中心", "体系",
-    "能力", "研发", "基地", "方案", "应用", "网", "院", "厂", "站", "所",
-    "实验室", "子系统", "平台",
-)
+
+def _starts_with_function_word(text: str) -> bool:
+    """片段是否以虚词 / 高频谓词开头（说明它是句子成分，不是专名）。"""
+    return text.startswith(_FUNC_HEAD)
+
+
+def _ends_with_abstract(text: str) -> bool:
+    """片段是否以抽象名词语素收尾（说明它是概念而非专名）。"""
+    return text.endswith(_ABSTRACT_TAIL)
+
+
+def _ends_with_function_word(text: str) -> bool:
+    """片段是否以虚词 / 谓词收尾（如「国家有关」「本项目相关」）。"""
+    return text.endswith(_FUNC_HEAD)
+
+
+def _looks_like_org(text: str) -> bool:
+    """按中文机构命名法判断是否为组织机构名（无需机构词库）。"""
+    n = len(text)
+    if n < 3 or _starts_with_function_word(text):
+        return False
+    for suf in _ORG_SUFFIX_STRONG:
+        if text.endswith(suf) and n - len(suf) >= 2:
+            return True
+    for suf in _ORG_SUFFIX_WEAK:
+        # 弱后缀要求更长的专名前缀，避免「数据中心」「生产车间」误判
+        if text.endswith(suf) and n - len(suf) >= 4:
+            return True
+    # 「中国 / 国家 / 中央 …」+ 专名 的机构简称（中国联通、国家电网），
+    # 但排除「中华民族」「中国传统」这类以抽象语素收尾的普通词组。
+    if (text.startswith(_ORG_HEAD) and 4 <= n <= 12
+            and not _ends_with_abstract(text)
+            and not _ends_with_function_word(text)):
+        return True
+    return False
+
+
+def _looks_like_geo(text: str) -> bool:
+    """按行政区划 / 地址构词法判断是否为地点名。"""
+    n = len(text)
+    if n < 3 or _starts_with_function_word(text) or _ends_with_abstract(text):
+        return False
+    for suf in _GEO_SUFFIX:
+        if text.endswith(suf) and n - len(suf) >= 2:
+            return True
+    return False
+
+
+def _looks_like_person(text: str) -> bool:
+    """按「高频姓氏 + 名」构词法判断 NER 候选是否为真实人名（误报抑制闸门）。
+
+    此处用高频姓氏先验（_SURNAMES_COMMON）而非完整百家姓：罕见姓氏的 NER
+    命中绝大多数是普通词（明白 / 应予以…），据此过滤可保精度；标签语境下
+    的罕见姓氏人名由 _looks_like_person_labeled（完整姓氏集）兜底。
+    """
+    n = len(text)
+    if not (2 <= n <= 4):
+        return False
+    if not all("\u4e00" <= c <= "\u9fff" for c in text):
+        return False
+    if _ends_with_abstract(text) or _starts_with_function_word(text):
+        return False
+    if n >= 3 and text[:2] in _SURNAMES_DOUBLE and text[:2] in _SURNAMES_COMMON:
+        return True
+    return text[0] in _SURNAMES_COMMON
+
+
+def _looks_like_person_labeled(text: str) -> bool:
+    """结构化字段（联系人 / 负责人：）里的值是否为人名。
+
+    标签本身已提供「这是人」的语境，因此不强制要求命中姓氏闭集，
+    只要求它不是机构 / 抽象概念 / 句子成分。
+    """
+    n = len(text)
+    if not (2 <= n <= 4):
+        return False
+    if not all("\u4e00" <= c <= "\u9fff" for c in text):
+        return False
+    if _ends_with_abstract(text) or _starts_with_function_word(text):
+        return False
+    if _ends_with_function_word(text):
+        return False
+    if text.endswith(_ORG_SUFFIX_STRONG) or text.endswith(_ORG_SUFFIX_WEAK):
+        return False
+    if text.endswith(_GEO_SUFFIX):
+        return False
+    if n >= 3 and text[:2] in _SURNAMES_DOUBLE:
+        return True
+    if text[0] in _SURNAMES:
+        return True
+    # 兜底：分词器整体判定为人名
+    toks = _pos_tokens(text)
+    return len(toks) == 1 and toks[0][1] == "nr"
+
+
+def _looks_like_project(text: str) -> bool:
+    """按「修饰 + 项目类中心词」构词法判断是否为项目 / 工程名。"""
+    n = len(text)
+    if n < 4 or _starts_with_function_word(text):
+        return False
+    # 「重要项目」「该工程」这类泛指不含实体指示语素，据此与真项目名区分
+    has_ind = any(ind in text for ind in _PROJECT_INDICATOR)
+    for core in _PROJECT_CORE_STRONG:
+        if text.endswith(core) and n - len(core) >= 2 and has_ind:
+            return True
+    for core in _PROJECT_CORE_WEAK:
+        # 弱中心词需要 >=4 字专名修饰：「网络威胁感知子系统」✓ 「开放平台」✗
+        if text.endswith(core) and n - len(core) >= 4:
+            return True
+    return False
 
 
 def _ner_should_suppress(text: str, text_type_name: str) -> bool:
-    """判断一个 NER 实体是否应被强制「不脱敏」（误报）。
+    """结构准入制：只有构词上具备专名特征的候选才允许脱敏。
 
-    返回 True 表示该实体是普通词语 / 非敏感信息，应当保留。
+    返回 True 表示该候选是普通词组 / 句子成分，应当原样保留。
+
+    与旧版「误报词黑名单」的区别：这里不查任何词表，而是检查候选是否
+    满足对应实体类型的构词规则，因此对没见过的普通词同样有效。
     """
-    if text in _NER_SUPPRESS:
+    t = (text or "").strip()
+    if len(t) <= 1:
+        return True
+    # 句子成分（以虚词 / 谓词开头）与抽象概念（以…性 /…度 /…化 收尾）一律排除
+    if _starts_with_function_word(t) or _ends_with_abstract(t):
         return True
 
-    # 单字实体几乎都是 NER 噪声（如「联」「深」），不可能是真实姓名/机构/地名
-    if len(text) <= 1:
-        return True
-
+    if text_type_name in ("company", "government"):
+        return not _looks_like_org(t)
     if text_type_name == "person":
-        # 仅接受 2~3 字、首字为常见姓氏的疑似姓名
-        if not (2 <= len(text) <= 3):
-            return True
-        return text[0] not in _SURNAMES
-
+        return not _looks_like_person(t)
     if text_type_name == "location":
-        # 仅接受以地名后缀结尾的词；裸「中国/北京」过于泛化，不脱敏
-        return not text.endswith(_LOC_SUFFIX)
-
-    # company / custom / 其他：交给白名单 + 阈值，这里不做额外拦截
-    return False
-
+        # 地名后缀，或本身就是带地名前缀的机构（北京市公安局）
+        return not (_looks_like_geo(t) or _looks_like_org(t))
+    if text_type_name == "project":
+        return not _looks_like_project(t)
+    # custom 及其它未知专名：须具备任一专名特征
+    return not (_looks_like_org(t) or _looks_like_geo(t) or _looks_like_project(t))
 
 
 def set_smart_sensitivity(key: str) -> None:
@@ -352,14 +559,227 @@ def _ner_threshold(text_type) -> float:
     return _SMART_THR["custom"]
 
 
-def _patch_detector_rules() -> None:
-    """给 mask-tool 的检测器补充高置信正则（幂等）。
 
-    解决两类原版漏检：
-      1) 阿拉伯数字金额必须带「万/亿」才被识别（"1,200,000元" 漏检）；
-         新增「纯数字+元」规则。
-      2) 中文大写金额（陆拾万元/壹佰万元）与「X项目/X工程」这类项目名
-         原版完全不识别；新增对应正则，作为高置信项始终脱敏。
+# ══════════════════════════════════════════════════════════════════
+# 词性定界：用汉语语法（虚词 / 谓词的分布规律）确定专名的左边界。
+# 这一层不含任何实体词，纯粹依赖分词器的词性标注。
+# ══════════════════════════════════════════════════════════════════
+
+#: 「硬断词」——绝不可能出现在专名内部的词类，专名起点必在其右侧。
+#:   p 介词(由/向/与/对)  r 代词(本/该/其)  d 副词(须/应/均)
+#:   u 助词(的/地/得)     y 语气词  e 叹词  o 拟声词  w 标点
+_POS_HARD: tuple[str, ...] = ("p", "r", "d", "u", "y", "e", "o", "w")
+
+#: 「不可起头」——可以出现在专名内部，但不能作为专名的第一个词。
+#:   c 连词(并/和/与)——「发展和改革委员会」内部合法，但不能起头
+#:   v 动词——「行政执法监督局」内部合法，但「邀请中国…协会」不合法
+#:   m/q 数量词、t 时间词、f 方位词
+_POS_NO_START: tuple[str, ...] = ("c", "m", "q", "t", "f")
+
+
+def _pos_tokens(text: str) -> list:
+    """分词 + 词性标注（带缓存）。分词器不可用时退化为整体一个名词。"""
+    cached = _POS_CACHE.get(text)
+    if cached is not None:
+        return cached
+    try:
+        import jieba.posseg as pseg
+        toks = [(w.word, w.flag) for w in pseg.cut(text)]
+    except Exception:
+        toks = [(text, "n")]
+    if len(_POS_CACHE) > 20000:
+        _POS_CACHE.clear()
+    _POS_CACHE[text] = toks
+    return toks
+
+
+_POS_CACHE: dict = {}
+
+
+def _pos_is_hard(flag: str) -> bool:
+    """是否为硬断词（专名内部不可能出现）。"""
+    return bool(flag) and flag[0] in _POS_HARD
+
+
+def _pos_is_soft(word: str, flag: str) -> bool:
+    """是否为软断词：多字纯动词，多半是句子谓语而非专名内部语素。
+
+    单字动词（中铁「建」、「新」建）常是专名构词成分，故不计入。
+    动名词 vn（建设 / 咨询 / 监理 / 运营）在机构名中极常见，也不计入。
+    """
+    return len(word) >= 2 and flag == "v"
+
+
+def _pos_can_start(flag: str) -> bool:
+    """该词类能否作为专名的起始词。"""
+    if not flag:
+        return False
+    if flag[0] in _POS_HARD:
+        return False
+    if flag[0] in _POS_NO_START:
+        return False
+    if flag[0] == "v" and not flag.startswith("vn"):
+        return False
+    return True
+
+
+def _pos_seg_from(toks: list, i: int) -> str:
+    """从第 i 个词起拼接为片段；若起始词不能起头则右移。"""
+    n = len(toks)
+    while i < n and not _pos_can_start(toks[i][1]):
+        i += 1
+    if i >= n:
+        return ""
+    return "".join(w for w, _ in toks[i:])
+
+
+#: 置于专名前、明确表示其后的「机构 / 地名」是本句宾语（而非专名一部分）
+#: 的谓语动词。这些是语法功能词，不是实体名，符合「构词法 + 语法」而非
+#: 「实体库」的识别思路。
+_PRED_BEFORE_ORG: tuple[str, ...] = (
+    "委托", "交由", "交给", "发包", "承包", "中标", "提供", "承担",
+    "通过", "经", "由", "向", "对", "就", "关于",
+)
+
+
+def _pos_org_head_shift(toks: list, k: int, cand: str, validate) -> str:
+    """机构名惯以行政区划 / 国名起头。
+
+    若起始词只是个普通名词，而其后出现地名（ns/nt）或行政层级词
+    （中国 / 国家 / 全国…），且两者衔接词是明确的谓语动词
+    （委托 / 提供 / 由 / 向…），说明前面的词其实是句子成分而非机构名的
+    一部分（「检测工作委托」国家…检验中心），据此把起点右移到该地名 /
+    层级词处。扫描整段 token，避免只看了紧邻的两三个词而错过深层机构名。
+    """
+    n = len(toks)
+    # 找到第一个可作为机构名起头的地名 / 层级词
+    idx = None
+    for j in range(k, n):
+        w, f = toks[j]
+        if f in ("ns", "nt") or w in _ORG_HEAD:
+            idx = j
+            break
+    if idx is None or idx == k:
+        return cand
+    prev = toks[idx - 1][0]
+    if prev not in _PRED_BEFORE_ORG:
+        return cand
+    better = "".join(x for x, _ in toks[idx:])
+    if better and validate(better):
+        return better
+    return cand
+
+
+def _pos_left_trim(text: str, validate, org_head: bool = False) -> str:
+    """剥离左侧句子成分，返回构词上成立的专名片段（失败返回空串）。
+
+    策略：
+      ① 硬断词（介词 / 代词 / 副词 / 助词）绝不出现在专名内部，
+         据此确定搜索下界 lo；
+      ② 候选起点按「最靠右的软断词之后」→「次靠右」→ … →「lo」
+         逐级回退，取第一个构词成立的片段。
+         这样「运营数据接入|昆山市大数据管理局」能在动词后正确断开，
+         而「全线通信传输网络扩容项目」里的「扩容」因断开后不成立
+         （只剩「项目」），会自动退回完整名称。
+    """
+    toks = _pos_tokens(text)
+    n = len(toks)
+    if n == 0:
+        return ""
+
+    lo = 0
+    for i in range(n):
+        if _pos_is_hard(toks[i][1]):
+            lo = i + 1
+    if lo >= n:
+        return ""
+
+    softs = [i + 1 for i in range(lo, n) if _pos_is_soft(toks[i][0], toks[i][1])]
+    for k in list(reversed(softs)) + [lo]:
+        cand = _pos_seg_from(toks, k)
+        if cand and validate(cand):
+            if org_head:
+                cand = _pos_org_head_shift(toks, k, cand, validate)
+            return cand
+    return ""
+
+
+class _PseudoMatch:
+    """轻量匹配对象，只实现 mask-tool 用到的 group / start / end。"""
+
+    __slots__ = ("_t", "_s", "_e")
+
+    def __init__(self, text: str, start: int, end: int) -> None:
+        self._t, self._s, self._e = text, start, end
+
+    def group(self, *_a):  # noqa: ANN002
+        return self._t
+
+    def start(self, *_a):  # noqa: ANN002
+        return self._s
+
+    def end(self, *_a):  # noqa: ANN002
+        return self._e
+
+
+class _SmartPattern:
+    """正则包装器：贪婪匹配定右边界，再用词性定左边界。
+
+    mask-tool 只调用 ``pattern.finditer(text)`` 以及 match 的
+    group/start/end，因此这里实现这三个接口即可无侵入接入。
+    """
+
+    __slots__ = ("_re", "_validate", "_trim", "_split", "_org_head")
+
+    def __init__(self, pattern, validate, trim: bool = True,
+                 split: bool = False, org_head: bool = False) -> None:
+        self._re = pattern
+        self._validate = validate
+        self._trim = trim
+        self._split = split
+        self._org_head = org_head
+
+    def _emit(self, raw: str, base: int, depth: int = 0):
+        """对一次原始匹配做左边界修剪，必要时递归回收被丢弃的左半段。"""
+        if not raw or depth > 3:
+            return
+        if not self._trim:
+            if self._validate(raw):
+                yield _PseudoMatch(raw, base, base + len(raw))
+            return
+
+        seg = _pos_left_trim(raw, self._validate, org_head=self._org_head)
+        if not seg:
+            return
+        off = len(raw) - len(seg)
+        # 被剥掉的左半段里可能还藏着另一个并列专名（A公司与B公司）
+        if self._split and off > 0:
+            head = raw[:off]
+            for m in self._re.finditer(head):
+                yield from self._emit(m.group(), base + m.start(), depth + 1)
+        yield _PseudoMatch(seg, base + off, base + off + len(seg))
+
+    def finditer(self, text: str):
+        for m in self._re.finditer(text):
+            yield from self._emit(m.group(), m.start())
+
+
+def _patch_detector_rules() -> None:
+    """给 mask-tool 的检测器补充「自主识别」正则（幂等）。
+
+    这些正则完全基于中文构词法与文档结构，不依赖任何实体词库 / 映射表：
+      · 组织机构名 —— 以组织形式后缀（有限公司 / 集团 / 研究院 / 管理局…）
+        收尾的专名。可识别任意此前没见过的单位，且能拿到完整名称，
+        不受 jieba 分词切分影响（NER 常把「中国移动通信集团有限公司」
+        截断成「中国移动通信集团」）。
+      · 详细地址 —— 行政区划链 + 街路号 / 园区 / 大厦。
+      · 项目 / 工程名 —— 修饰语 + 项目类中心词；以及标题行中以
+        「子系统 / 系统 / 平台」收尾的项目名。
+      · 结构化字段 —— 泛化的「XX名称：」「XX单位：」「XX人：」标签模式。
+        对标签「尾字」做定宽 lookbehind，因此「项目名称 / 采购人 /
+        使用单位 / 最终用户 / 供应商 / 甲方 / 项目地点」等任意写法都能
+        命中，无需逐个登记标签。
+      · 金额 —— 阿拉伯数字与中文大写两种写法（原版仅识别带万/亿的）。
     """
     try:
         from mask_tool.core.detector import Detector
@@ -370,68 +790,159 @@ def _patch_detector_rules() -> None:
 
         _orig = Detector._build_regex_rules  # type: ignore[assignment]
 
-        # 项目 / 工程名正则：必须是「以边界字符起始」的专有名词短语，
-        # 且内部须出现真实实体指示词（系统/平台/扩容/软件…），且不能以
-        # 「根据/卖方/确保/本/该…」等动词或指代词开头——否则会把整个
-        # 句子片段（如「卖方应在本项目」「根据项目」「参加过的重要项目
-        # 及在该项目」）当成项目名整段吞掉。非贪婪 + 长度上限避免越界。
-        _proj_starters = "|".join(_PROJECT_NON_STARTER)
-        _proj_indicators = "|".join(_PROJECT_INDICATOR)
-        _project_re = re.compile(
-            r"(?:^|(?<=[\s《（(「“、，。：；！？\n~～—\-]))"
-            rf"(?!{_proj_starters})"
-            r"[一-鿿]{1,24}?"
-            rf"(?:{_proj_indicators})"
-            r"[一-鿿]{0,24}?"
-            r"(?:项目|工程)",
-            re.UNICODE,
+        _org_strong = "|".join(_ORG_SUFFIX_STRONG)
+        _org_medium = "|".join(_ORG_SUFFIX_MEDIUM)
+        _org_any = "|".join(_ORG_SUFFIX_STRONG + _ORG_SUFFIX_MEDIUM)
+
+        # ① 组织机构名。贪婪前缀确保拿到完整名称（不会像 NER 那样把
+        #    「中国移动通信集团有限公司」截断成「中国移动通信集团」），
+        #    左边界随后交给 _SmartPattern 按词性剥离。
+        _org_re = _SmartPattern(
+            re.compile(rf"[一-鿿]{{2,24}}(?:{_org_strong})", re.UNICODE),
+            _looks_like_org, split=True, org_head=True,
         )
+        # ②「弱后缀」机构（…监督局 /…管理厅 /…检验中心）：需更长专名前缀
+        _org_re2 = _SmartPattern(
+            re.compile(rf"[一-鿿]{{4,24}}(?:{_org_medium})", re.UNICODE),
+            _looks_like_org, split=True, org_head=True,
+        )
+
+        # ③ 详细地址：行政区划链 + 街路号 / 园区 / 大厦（贪婪取最长）
+        _addr_re = _SmartPattern(
+            re.compile(
+                r"(?:[一-鿿]{2,6}(?:省|自治区|特别行政区))?"
+                r"[一-鿿]{2,6}(?:市|自治州|地区)"
+                r"(?:[一-鿿]{2,6}(?:区|县|市|旗))?"
+                r"[一-鿿]{0,16}"
+                r"(?:软件园|科技园|工业园|开发区|高新区|园区|新区|大厦|广场|大道|路|街|巷)"
+                r"(?:[0-9０-９]{1,4}号)?",
+                re.UNICODE,
+            ),
+            _looks_like_geo,
+        )
+
+        # ④ 项目 / 工程名（强中心词）。校验函数要求内部含实体指示语素，
+        #    因此「重要项目」「该工程」这类泛指不会命中。
+        _proj_strong = "|".join(_PROJECT_CORE_STRONG)
+        _project_re = _SmartPattern(
+            re.compile(rf"[一-鿿]{{2,24}}?(?:{_proj_strong})", re.UNICODE),
+            _looks_like_project,
+        )
+
+        # ⑤ 标题行项目名（弱中心词）：独立成行、无章节编号的短行，
+        #    以「子系统 / 系统 / 平台」收尾。技术规范书封面与大标题里的
+        #    项目名多是这种形态；正文中的「入侵检测系统」不独立成行，
+        #    因此不会被命中。该规则本身已由行结构锚定，无需词性修剪。
+        _proj_weak = "|".join(_PROJECT_CORE_WEAK)
+        _func = "|".join(_FUNC_HEAD)
+        _title_re = _SmartPattern(
+            re.compile(
+                r"(?<=\n)[ \t]*"
+                r"(?![0-9０-９一二三四五六七八九十]{1,3}[\.、．　 ])"
+                rf"(?!{_func})"
+                r"[一-鿿A-Za-z0-9（）()·\-]{4,32}?"
+                rf"(?:{_proj_weak})"
+                r"[ \t]*(?=\n)",
+                re.UNICODE,
+            ),
+            lambda s: True, trim=False,
+        )
+
+        # ⑥ 结构化字段值。标签本身即强语境，值按「遇标点即止」取整。
+        _val = r"[一-鿿A-Za-z0-9·（）()\.\-]{2,40}"
+        _val_org = rf"[一-鿿A-Za-z0-9·（）()\.\-]{{2,30}}?(?:{_org_any})"
+        _val_person = r"[一-鿿]{2,4}(?![一-鿿])"
+
+        def _lab(tails, val_re):
+            """构造「标签尾字 + 冒号」→ 值 的定宽 lookbehind 正则。
+
+            对标签「尾字」而非整个标签做匹配，因此「项目名称 / 采购人 /
+            使用单位 / 最终用户 / 供应商 / 甲方 / 项目地点」等任意写法
+            都能命中，无需逐个登记标签。
+            """
+            alts = "|".join(f"(?<={t}[:：])" for t in tails)
+            return re.compile(f"(?:{alts})[ \t　]*{val_re}", re.UNICODE)
 
         def _build(self):  # noqa: ANN001
             rules = _orig(self)
             extra = [
-                # 阿拉伯数字金额（含「元」但不带万/亿，如 1,200,000元 / 500元）
+                # 金额：阿拉伯数字（含「元」但不带万 / 亿，如 1,200,000元）
                 (re.compile(r"[\d,]+\.?\d*元"), DetectionType.AMOUNT, 0.80),
-                # 中文大写金额：陆拾万元 / 壹佰万元 / 伍仟元 / 十亿
-                # 注意：前导数字不含「万/亿」，且整体须以 元/圆/万/亿 收尾，
-                # 避免把「一个」「十」之类的普通词误判为金额。
-                (re.compile(r"[零〇一二三四五六七八九十百千壹贰叁肆伍陆柒捌玖拾佰仟]+(?:[万亿]?元|[万亿]?圆|万|亿)"),
+                # 金额：中文大写（陆拾万元 / 壹佰万元 / 伍仟元）。
+                # 前导数字不含万 / 亿，且整体须以 元 / 圆 / 万 / 亿 收尾，
+                # 避免把「一个」「十」之类普通词误判为金额。
+                (re.compile(
+                    r"[零〇一二三四五六七八九十百千壹贰叁肆伍陆柒捌玖拾佰仟]+"
+                    r"(?:[万亿]?元|[万亿]?圆|万|亿)"),
                  DetectionType.AMOUNT, 0.85),
-                # 项目 / 工程名：受上述严格约束，只匹配真实专有名词短语
+                # 组织机构名（自主识别，可命中任意陌生单位）
+                (_org_re, DetectionType.COMPANY, 0.92),
+                (_org_re2, DetectionType.COMPANY, 0.90),
+                # 详细地址
+                (_addr_re, DetectionType.LOCATION, 0.88),
+                # 项目 / 工程名
                 (_project_re, DetectionType.PROJECT, 0.85),
+                (_title_re, DetectionType.PROJECT, 0.75),
             ]
 
-            # —— 结构化敏感字段：标签后的值（高置信，仅脱敏值、保留标签）——
-            # 技术规范书 / 合同里，「项目名称」「客户名称」「建设单位」等字段
-            # 明确标注了敏感信息，但原 mask-tool 只靠 NER/词库置信度，对
-            # 「中电信数智科技有限公司」这类陌生机构、或以「子系统」结尾的项目
-            # 名（不以项目/工程收尾）经常漏检。这里用「标签 → 值」正则直接命中，
-            # 属于 regex 来源，不受 NER 误报抑制影响，召回高且不误伤普通词。
-            # 值以标点 / 空白为边界（不含在字符集内），只吞标签后的专有名词。
-            _val = r"[一-鿿A-Za-z0-9·（）()\.\-\s]{1,49}"
-            _name = r"[一-鿿]{2,4}"
-            def _lab_re(labels, val_re):
-                alts = "|".join(f"(?<={l}[:：])" for l in labels)
-                return re.compile(f"(?:{alts}){val_re}")
+            # —— 结构化字段：泛化「标签 → 值」模式（不枚举具体标签）——
             extra += [
-                # 项目名（项目名称）
-                (_lab_re(["项目名称"], _val), DetectionType.PROJECT, 0.90),
-                # 机构 / 客户名：客户/建设（宽 5）
-                (_lab_re(["客户名称", "建设单位"], _val), DetectionType.COMPANY, 0.90),
-                # 机构 / 客户名：中标/承包/供货/供应（宽 4）
-                (_lab_re(["中标人", "承包人", "供货商", "供应商"], _val),
-                 DetectionType.COMPANY, 0.90),
-                # 机构 / 客户名：甲/乙/丙方（宽 3）
-                (_lab_re(["甲方", "乙方", "丙方"], _val), DetectionType.COMPANY, 0.90),
-                # 地点（项目地点）
-                (_lab_re(["项目地点"], _val), DetectionType.LOCATION, 0.90),
-                # 联系人 / 收件人（人名）
-                (_lab_re(["联系人", "收件人"], _name), DetectionType.PERSON, 0.90),
+                # 「…名称：」值带组织后缀 → 机构；否则 → 项目名
+                (_lab(["名称"], _val_org), DetectionType.COMPANY, 0.92),
+                (_lab(["名称"], _val), DetectionType.PROJECT, 0.90),
+                # 「…单位 / 公司 / 商 / 机构 / 客户 / 用户 / 业主 /
+                #   部门 / 厂商 / 方：」→ 机构
+                (_lab(["单位", "公司", "商", "机构", "客户", "用户", "业主",
+                       "部门", "厂商", "甲方", "乙方", "丙方"],
+                      _val), DetectionType.COMPANY, 0.90),
+                # 「…地点 / 地址：」→ 地点
+                (_lab(["地点", "地址"], _val), DetectionType.LOCATION, 0.90),
+                # 「…人：」→ 人名（构词校验，排除机构 / 地名 / 抽象概念）
+                (_SmartPattern(_lab(["人"], _val_person),
+                               _looks_like_person_labeled, trim=False),
+                 DetectionType.PERSON, 0.88),
             ]
             return rules + extra
 
         Detector._build_regex_rules = _build  # type: ignore[assignment]
         Detector._patched_rules_by_engine = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _patch_detector_dedup() -> None:
+    """检测结果子串去重（幂等）。
+
+    自主识别的多条规则常对同一实体给出长短不一的片段
+    （「中铁建电气化局」「工程有限公司」「中铁建电气化局集团第三工程
+    有限公司」）。这里只保留最长的那条，避免映射表被碎片刷屏。
+    用户词库命中的条目不参与裁剪。
+    """
+    try:
+        from mask_tool.core.detector import Detector
+
+        if getattr(Detector, "_patched_dedup_by_engine", False):
+            return
+
+        _orig_detect = Detector.detect  # type: ignore[assignment]
+
+        def detect(self, text, file_path=""):  # noqa: ANN001
+            results = _orig_detect(self, text, file_path)
+            kept_texts: list[str] = []
+            drop: set[str] = set()
+            for t in sorted({r.text for r in results}, key=len, reverse=True):
+                if any(t in o for o in kept_texts):
+                    drop.add(t)
+                else:
+                    kept_texts.append(t)
+            if not drop:
+                return results
+            return [r for r in results
+                    if r.text not in drop
+                    or getattr(r, "source", "") == "dictionary"]
+
+        Detector.detect = detect  # type: ignore[assignment]
+        Detector._patched_dedup_by_engine = True  # type: ignore[attr-defined]
     except Exception:
         pass
 
@@ -886,6 +1397,7 @@ class MaskEngine:
             _patch_mask_tool_adapters()
             # 补充高置信正则（中文金额 / 项目工程名 / 纯数字金额）
             _patch_detector_rules()
+            _patch_detector_dedup()
             # 注入「检测灵敏度」可控的 smart/aggressive 策略
             _patch_policy()
             return (Pipeline, MaskConfig, DetectionStatus)
