@@ -21,6 +21,7 @@ import sys
 import threading
 import traceback
 from pathlib import Path
+import tkinter as tk
 from tkinter import (
     BooleanVar, Listbox, StringVar, Tk, filedialog, messagebox, ttk,
 )
@@ -28,6 +29,7 @@ from tkinter import (
 from app import settings
 from app.engine import (
     MODE_LABELS, MODES, REPORT_ONLY_EXTS, SUPPORTED_EXTS,
+    SENSITIVITY_LEVELS, SENSITIVITY_KEYS, SENSITIVITY_DEFAULT,
     FileResult, MaskEngine, MaskToolNotFound, ToolInfo, locate_mask_tool,
 )
 
@@ -115,6 +117,56 @@ def human_size(p: Path) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024.0
     return "-"
+
+
+class Tooltip:
+    """轻量悬浮提示：鼠标悬停在控件上时显示一段说明文字。"""
+
+    def __init__(self, widget, text: str, wraplength: int = 360):
+        self.widget = widget
+        self.text = text
+        self.wraplength = wraplength
+        self._win: "tk.Toplevel | None" = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+        widget.bind("<ButtonPress>", self._hide)
+
+    def _show(self, _event=None) -> None:
+        if self._win or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        except Exception:
+            return
+        win = tk.Toplevel(self.widget)
+        win.wm_overrideredirect(True)
+        win.wm_geometry(f"+{x}+{y}")
+        fam, size = ui_font()
+        lbl = ttk.Label(
+            win, text=self.text, justify="left",
+            background="#ffffe0", foreground="#222222",
+            relief="solid", borderwidth=1,
+            font=(fam, max(size - 1, 8)),
+            padding=(7, 5), wraplength=self.wraplength,
+        )
+        lbl.pack()
+        try:
+            win.lift()
+        except Exception:
+            pass
+        self._win = win
+
+    def _hide(self, _event=None) -> None:
+        if self._win is not None:
+            try:
+                self._win.destroy()
+            except Exception:
+                pass
+            self._win = None
+
+    def set_text(self, text: str) -> None:
+        self.text = text
 
 
 # --------------------------------------------------------------------------
@@ -245,17 +297,41 @@ class MaskApp:
         self.cmb_mode = ttk.Combobox(
             opt, textvariable=self.var_mode, state="readonly",
             values=[MODE_LABELS[m] for m in MODES], width=42,
+            command=self._sync_sens_state,
         )
         self.cmb_mode.set(MODE_LABELS.get(self.cfg["mode"], MODE_LABELS["smart"]))
         self.cmb_mode.grid(row=0, column=1, sticky="w", padx=(0, 8))
+
+        # ---- 检测灵敏度（smart / aggressive） ----
+        ttk.Label(opt, text="检测灵敏度：").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        sens_row = ttk.Frame(opt)
+        sens_row.grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        self.var_sens = StringVar(value=self.cfg.get("sensitivity") or SENSITIVITY_DEFAULT)
+        self._sens_radios: list[ttk.Radiobutton] = []
+        self._sens_tooltips: dict[str, Tooltip] = {}
+        for key in SENSITIVITY_KEYS:
+            lvl = SENSITIVITY_LEVELS[key]
+            rb = ttk.Radiobutton(
+                sens_row, text=lvl["label"], value=key,
+                variable=self.var_sens, command=self._on_sens_change,
+            )
+            rb.pack(side="left", padx=(0, 8))
+            self._sens_tooltips[key] = Tooltip(rb, lvl["desc"])
+            self._sens_radios.append(rb)
+
+        # 当前档位释义（常驻显示，强化悬浮提示）
+        self.lbl_sens_desc = ttk.Label(
+            opt, text="", style="Hint.TLabel", wraplength=660, justify="left",
+        )
+        self.lbl_sens_desc.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         self.var_mapping = BooleanVar(value=bool(self.cfg["save_mapping"]))
         ttk.Checkbutton(opt, text="导出映射表（用于还原）",
                         variable=self.var_mapping).grid(row=0, column=2, sticky="e")
 
-        ttk.Label(opt, text="输出位置：").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(opt, text="输出位置：").grid(row=3, column=0, sticky="w", pady=(6, 0))
         outrow = ttk.Frame(opt)
-        outrow.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+        outrow.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(6, 0))
         outrow.columnconfigure(1, weight=1)
 
         self.var_outmode = StringVar(value=self.cfg["output_mode"])
@@ -304,6 +380,7 @@ class MaskApp:
         self.btn_run.pack(side="left")
 
         self._sync_out_state()
+        self._sync_sens_state()
 
     def _bind_events(self) -> None:
         self.tree.bind("<Double-1>", self._on_double_click)
@@ -445,6 +522,26 @@ class MaskApp:
         state = "normal" if custom else "disabled"
         self.ent_outdir.configure(state=state)
         self.btn_outdir.configure(state=state)
+
+    def _on_sens_change(self) -> None:
+        key = self.var_sens.get()
+        self.cfg["sensitivity"] = key
+        settings.save(self.cfg)
+        self._sync_sens_state()
+
+    def _sync_sens_state(self) -> None:
+        """灵敏度仅对 smart / aggressive 生效，strict 下禁用并提示。"""
+        key = self.var_sens.get()
+        strict = self._current_mode() == "strict"
+        state = "disabled" if strict else "normal"
+        for rb in self._sens_radios:
+            rb.configure(state=state)
+        if strict:
+            self.lbl_sens_desc.configure(
+                text="strict 模式仅使用用户词库，检测灵敏度设置不生效。")
+        else:
+            lvl = SENSITIVITY_LEVELS.get(key, SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT])
+            self.lbl_sens_desc.configure(text=lvl["desc"])
 
     # -- 用户词库 ---------------------------------------------------------
 
@@ -713,9 +810,11 @@ class MaskApp:
         save_mapping = bool(self.var_mapping.get())
         custom = self.var_outmode.get() == "custom"
         outdir = Path(self.var_outdir.get().strip()) if custom else None
+        sensitivity = self.var_sens.get() or SENSITIVITY_DEFAULT
 
         self.cfg.update({
             "mode": mode,
+            "sensitivity": sensitivity,
             "output_mode": self.var_outmode.get(),
             "custom_output": self.var_outdir.get().strip(),
             "save_mapping": save_mapping,
@@ -752,6 +851,7 @@ class MaskApp:
                     mode=mode,
                     save_mapping=save_mapping,
                     suffix_tag=suffix,
+                    sensitivity=sensitivity,
                     on_progress=lambda i, n, p: self.msg_q.put(("progress", (i, n, p))),
                     on_result=lambda r: self.msg_q.put(("result", r)),
                 )

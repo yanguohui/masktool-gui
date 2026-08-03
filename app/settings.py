@@ -11,6 +11,7 @@ APP_NAME = "MaskToolGUI"
 
 DEFAULTS: dict[str, Any] = {
     "mode": "smart",
+    "sensitivity": "medium",      # smart/aggressive 检测灵敏度：high/medium/low/minimal
     "output_mode": "source",      # source = 原文件目录 / custom = 指定目录
     "custom_output": "",
     "save_mapping": True,

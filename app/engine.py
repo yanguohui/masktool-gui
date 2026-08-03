@@ -157,6 +157,126 @@ MODE_LABELS: dict[str, str] = {
     "aggressive": "aggressive（激进）— 高召回，宁可错杀",
 }
 
+# --------------------------------------------------------------------------
+# smart / aggressive 模式的「检测灵敏度」
+# --------------------------------------------------------------------------
+# 问题根源：mask-tool 中 AUTO_MASK 与 SUGGEST_MASK 的结果都会被实际替换，
+# 因此真正决定"是否脱敏"的阈值是 suggest_mask；而原 smart 默认
+# suggest_mask=0.55 过低，导致 jieba NER 把"新建""中华民族""系统安全"
+# 这类普通词语（置信度约 0.60~0.75）也当成实体脱敏，误伤很多。
+#
+# 这里把检测能力拆成两类区别对待：
+#   · 词库匹配（lexicon）+ 正则类（手机/身份证/邮箱/金额/IP/MAC/日期）：
+#     置信度高、误报少，无论灵敏度如何都照常脱敏；
+#   · NER（人名/机构/地名等智能识别项）：置信度偏低、误报多，按用户
+#     选择的灵敏度阈值裁剪 —— 这才是"灵敏度"真正调节的对象。
+#
+# 每个档位给出 ner_auto / ner_suggest 两个阈值（>=auto 自动脱敏，
+# >=suggest 建议脱敏，二者都会被替换）；regex 下限固定，保证高置信
+# 信息不被灵敏度误关。
+
+SENSITIVITY_LEVELS: dict[str, dict] = {
+    "high": {
+        "label": "高（激进召回）",
+        "ner_auto": 0.66, "ner_suggest": 0.55,
+        "desc": (
+            "几乎不漏掉任何疑似信息：人名/机构/地名等智能识别项全部参与脱敏。"
+            "代价是误伤最多，普通词语如「新建」「中华民族」「系统安全」也常被"
+            "误判为敏感。仅在宁可错杀、事后人工复核的场景使用。"
+        ),
+    },
+    "medium": {
+        "label": "中（推荐）",
+        "ner_auto": 0.85, "ner_suggest": 0.78,
+        "desc": (
+            "平衡之选：手机、身份证、邮箱、金额、IP、MAC 等高置信信息照常脱敏；"
+            "仅压制低置信的 NER 误报，大幅减少「新建」「严格遵守」这类误伤，"
+            "同时保留较长、带实体后缀的真实机构名与人名。"
+        ),
+    },
+    "low": {
+        "label": "低（保守精准）",
+        "ner_auto": 0.90, "ner_suggest": 0.85,
+        "desc": (
+            "只脱敏置信度很高的智能识别项（≥0.85，多为真实机构名、长专有名词），"
+            "几乎不误伤普通词语；短人名等需依赖用户词库或 strict 模式保障。"
+        ),
+    },
+    "minimal": {
+        "label": "极低（审慎）",
+        "ner_auto": 0.95, "ner_suggest": 0.92,
+        "desc": (
+            "仅处理最高置信的少量项，误伤最少；适合对误报零容忍、宁可漏掉的场合。"
+            "智能识别基本只保留用户词库匹配项。"
+        ),
+    },
+}
+SENSITIVITY_KEYS: tuple[str, ...] = ("high", "medium", "low", "minimal")
+SENSITIVITY_DEFAULT = "medium"
+
+#: 正则类（高精度）始终脱敏的下限，与灵敏度无关
+_REGEX_AUTO = 0.70
+_REGEX_SUGGEST = 0.55
+
+#: 当前生效的灵敏度（由 UI 在每次处理前设置）
+_SMART_SENSITIVITY = dict(SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT])
+
+
+def set_smart_sensitivity(key: str) -> None:
+    """切换当前生效的检测灵敏度（影响后续 smart/aggressive 处理）。"""
+    global _SMART_SENSITIVITY
+    _SMART_SENSITIVITY = dict(SENSITIVITY_LEVELS.get(key, SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT]))
+
+
+def _patch_policy() -> None:
+    """对 mask-tool 的 PolicyEngine 打补丁（幂等）。
+
+    仅对 smart / aggressive 模式生效：词库与正则高置信项始终脱敏，
+    NER 项按用户灵敏度阈值裁剪，从而在不影响手机/身份证/邮箱/金额等
+    高价值信息脱敏的前提下，抑制智能识别的误伤。
+    """
+    try:
+        from mask_tool.core.policy import PolicyEngine
+        from mask_tool.models.detection import DetectionStatus
+
+        if getattr(PolicyEngine, "_patched_by_engine", False):
+            return
+
+        _orig_decide = PolicyEngine._decide  # type: ignore[assignment]
+
+        def _decide(self, result):  # noqa: ANN001
+            mode = self.config.mode
+            if mode in ("smart", "aggressive"):
+                conf = result.confidence
+                src = getattr(result, "source", "") or ""
+                if src == "dictionary":
+                    # 用户词库 / 基准词库：永远脱敏
+                    return DetectionStatus.AUTO_MASK if conf >= 0.95 \
+                        else DetectionStatus.HINT_ONLY
+                if src == "regex":
+                    # 高置信正则（手机/身份证/邮箱/金额/IP/MAC/日期）始终脱敏
+                    if conf >= _REGEX_AUTO:
+                        return DetectionStatus.AUTO_MASK
+                    if conf >= _REGEX_SUGGEST:
+                        return DetectionStatus.SUGGEST_MASK
+                    return DetectionStatus.HINT_ONLY
+                # NER（及未知来源）：按用户灵敏度裁剪，避免误伤普通词语
+                a = _SMART_SENSITIVITY["ner_auto"]
+                s = _SMART_SENSITIVITY["ner_suggest"]
+                if conf >= a:
+                    return DetectionStatus.AUTO_MASK
+                if conf >= s:
+                    return DetectionStatus.SUGGEST_MASK
+                return DetectionStatus.HINT_ONLY
+            # strict / focused 等模式沿用上游原始逻辑
+            return _orig_decide(self, result)
+
+        PolicyEngine._decide = _decide  # type: ignore[assignment]
+        PolicyEngine._patched_by_engine = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 #: 单个文件处理超时（秒）
 PER_FILE_TIMEOUT = 600
 
@@ -540,6 +660,8 @@ class MaskEngine:
             from mask_tool.models.detection import DetectionStatus
             # 修复上游 docx 多实体替换串扰缺陷
             _patch_mask_tool_adapters()
+            # 注入「检测灵敏度」可控的 smart/aggressive 策略
+            _patch_policy()
             return (Pipeline, MaskConfig, DetectionStatus)
         except Exception:
             return None
@@ -606,6 +728,7 @@ class MaskEngine:
         mode: str = "smart",
         save_mapping: bool = True,
         suffix_tag: str = "_脱敏",
+        sensitivity: str = SENSITIVITY_DEFAULT,
     ) -> FileResult:
         """处理单个文件。任何异常都被转换为 FileResult，不向上抛。"""
         ext = src.suffix.lower()
@@ -620,7 +743,7 @@ class MaskEngine:
         # 优先使用进程内调用（冻结打包后唯一可靠路径）
         if self._inproc is not None:
             return self._process_one_inproc(
-                src, out_dir, mode, save_mapping, suffix_tag
+                src, out_dir, mode, save_mapping, suffix_tag, sensitivity
             )
 
         report_only = ext in REPORT_ONLY_EXTS
@@ -707,10 +830,14 @@ class MaskEngine:
         mode: str,
         save_mapping: bool,
         suffix_tag: str,
+        sensitivity: str = SENSITIVITY_DEFAULT,
     ) -> FileResult:
         """进程内调用 mask-tool 的 Pipeline（冻结打包后的主路径）。"""
         ext = src.suffix.lower()
         report_only = ext in REPORT_ONLY_EXTS
+
+        # 应用用户选择的 smart/aggressive 检测灵敏度（仅对 NER 生效）
+        set_smart_sensitivity(sensitivity)
 
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -813,6 +940,7 @@ class MaskEngine:
         mode: str = "smart",
         save_mapping: bool = True,
         suffix_tag: str = "_脱敏",
+        sensitivity: str = SENSITIVITY_DEFAULT,
         on_progress: Callable[[int, int, Path], None] | None = None,
         on_result: Callable[[FileResult], None] | None = None,
     ) -> BatchOutcome:
@@ -831,6 +959,7 @@ class MaskEngine:
             res = self.process_one(
                 src, out_dir_for(src), mode=mode,
                 save_mapping=save_mapping, suffix_tag=suffix_tag,
+                sensitivity=sensitivity,
             )
             outcome.results.append(res)
             if on_result:
