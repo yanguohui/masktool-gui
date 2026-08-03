@@ -400,6 +400,34 @@ def _patch_detector_rules() -> None:
                 # 项目 / 工程名：受上述严格约束，只匹配真实专有名词短语
                 (_project_re, DetectionType.PROJECT, 0.85),
             ]
+
+            # —— 结构化敏感字段：标签后的值（高置信，仅脱敏值、保留标签）——
+            # 技术规范书 / 合同里，「项目名称」「客户名称」「建设单位」等字段
+            # 明确标注了敏感信息，但原 mask-tool 只靠 NER/词库置信度，对
+            # 「中电信数智科技有限公司」这类陌生机构、或以「子系统」结尾的项目
+            # 名（不以项目/工程收尾）经常漏检。这里用「标签 → 值」正则直接命中，
+            # 属于 regex 来源，不受 NER 误报抑制影响，召回高且不误伤普通词。
+            # 值以标点 / 空白为边界（不含在字符集内），只吞标签后的专有名词。
+            _val = r"[一-鿿A-Za-z0-9·（）()\.\-\s]{1,49}"
+            _name = r"[一-鿿]{2,4}"
+            def _lab_re(labels, val_re):
+                alts = "|".join(f"(?<={l}[:：])" for l in labels)
+                return re.compile(f"(?:{alts}){val_re}")
+            extra += [
+                # 项目名（项目名称）
+                (_lab_re(["项目名称"], _val), DetectionType.PROJECT, 0.90),
+                # 机构 / 客户名：客户/建设（宽 5）
+                (_lab_re(["客户名称", "建设单位"], _val), DetectionType.COMPANY, 0.90),
+                # 机构 / 客户名：中标/承包/供货/供应（宽 4）
+                (_lab_re(["中标人", "承包人", "供货商", "供应商"], _val),
+                 DetectionType.COMPANY, 0.90),
+                # 机构 / 客户名：甲/乙/丙方（宽 3）
+                (_lab_re(["甲方", "乙方", "丙方"], _val), DetectionType.COMPANY, 0.90),
+                # 地点（项目地点）
+                (_lab_re(["项目地点"], _val), DetectionType.LOCATION, 0.90),
+                # 联系人 / 收件人（人名）
+                (_lab_re(["联系人", "收件人"], _name), DetectionType.PERSON, 0.90),
+            ]
             return rules + extra
 
         Detector._build_regex_rules = _build  # type: ignore[assignment]
@@ -737,6 +765,15 @@ def locate_mask_tool(manual_path: str | None = None) -> ToolInfo:
         ver = _verify(argv)
         if ver is not None:
             return ToolInfo(argv, "python -m mask_tool", ver)
+
+    # 最终回退：mask-tool 已在当前进程内可导入（如开发环境从装好 mask_tool
+    # 的 venv 直接跑 python main.py）。此时走进程内调用，无需外部命令。
+    try:
+        import importlib
+        importlib.import_module("mask_tool")
+        return ToolInfo(["(内嵌进程调用)"], "已安装 mask_tool（进程内调用）", "")
+    except Exception:
+        pass
 
     detail = "\n".join(f"  · {t}" for t in tried)
     raise MaskToolNotFound(detail)
