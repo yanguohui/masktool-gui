@@ -297,10 +297,10 @@ class MaskApp:
         self.cmb_mode = ttk.Combobox(
             opt, textvariable=self.var_mode, state="readonly",
             values=[MODE_LABELS[m] for m in MODES], width=42,
-            command=self._sync_sens_state,
         )
         self.cmb_mode.set(MODE_LABELS.get(self.cfg["mode"], MODE_LABELS["smart"]))
         self.cmb_mode.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self.cmb_mode.bind("<<ComboboxSelected>>", lambda _e: self._sync_sens_state())
 
         # ---- 检测灵敏度（smart / aggressive） ----
         ttk.Label(opt, text="检测灵敏度：").grid(row=1, column=0, sticky="w", pady=(6, 0))
