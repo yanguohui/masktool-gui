@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
@@ -504,12 +505,14 @@ def build_output_name(src: Path, suffix_tag: str = "_脱敏") -> str:
 class MaskEngine:
     """对 mask-tool 的高层封装。"""
 
-    def __init__(self, tool: ToolInfo):
+    def __init__(self, tool: ToolInfo, user_lexicon: dict | None = None):
         self.tool = tool
         self._current: subprocess.Popen | None = None
         self._cancelled = False
         # 进程内调用后端：(Pipeline 类, MaskConfig 类, DetectionStatus)；不可用为 None
         self._inproc = self._init_inproc()
+        # 用户词库：合并基准词库后写出临时 YAML，返回路径；空则 None
+        self._user_lexicon_file = self._build_user_lexicon(user_lexicon or {})
 
     # -- 取消控制 ---------------------------------------------------------
 
@@ -538,6 +541,59 @@ class MaskEngine:
             # 修复上游 docx 多实体替换串扰缺陷
             _patch_mask_tool_adapters()
             return (Pipeline, MaskConfig, DetectionStatus)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _build_user_lexicon(user_lexicon: dict) -> str | None:
+        """把打包基准词库与用户词库合并，写出临时 YAML，返回路径。
+
+        用户词库为空时返回 ``None``，引擎改用打包基准词库
+        （``assets/mask_tool_config/sample_lexicon.yaml``）。
+        词库匹配置信度为 0.95，strict/smart/aggressive 三档都会自动替换，
+        因此用户词库对所有模式都有效，尤其 strict 几乎完全依赖它。
+        """
+        if not user_lexicon:
+            return None
+
+        # 基准词库（打包进 exe 的示例词库）
+        base: dict = {}
+        cfg_dir = _bundled_config_dir()
+        if cfg_dir is not None:
+            sample = cfg_dir / "sample_lexicon.yaml"
+            if sample.is_file():
+                try:
+                    import yaml
+                    loaded = yaml.safe_load(sample.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        base = loaded
+                except Exception:
+                    base = {}
+
+        merged: dict = {k: list(v) for k, v in base.items()}
+        for cat, words in user_lexicon.items():
+            if not isinstance(words, list):
+                continue
+            cur = list(merged.get(cat, []))
+            for w in words:
+                if isinstance(w, str) and w.strip() and w not in cur:
+                    cur.append(w)
+            if cur:
+                merged[cat] = cur
+
+        if not merged:
+            return None
+
+        tmp_dir = tempfile.mkdtemp(prefix="masktool_lex_")
+        out = Path(tmp_dir) / "user_lexicon.yaml"
+        try:
+            import yaml
+            out.write_text(
+                yaml.dump(merged, allow_unicode=True, default_flow_style=False),
+                encoding="utf-8",
+            )
+            atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)
+            return str(out)
         except Exception:
             return None
 
@@ -676,14 +732,19 @@ class MaskEngine:
         if cfg is None:
             cfg = MaskConfig(mode=mode)
 
-        # 把词库/白名单指向上面打包进 exe 的资源，保证冻结后也能加载
+        # 把白名单指向上面打包进 exe 的资源，保证冻结后也能加载
         if cfg_dir is not None:
-            lex = cfg_dir / "sample_lexicon.yaml"
             wlt = cfg_dir / "whitelist.yaml"
-            if lex.is_file():
-                cfg.lexicon_path = str(lex)
             if wlt.is_file():
                 cfg.whitelist_path = str(wlt)
+
+        # 用户词库优先（已合并基准词库）；否则用打包基准词库
+        if self._user_lexicon_file and Path(self._user_lexicon_file).is_file():
+            cfg.lexicon_path = self._user_lexicon_file
+        elif cfg_dir is not None:
+            lex = cfg_dir / "sample_lexicon.yaml"
+            if lex.is_file():
+                cfg.lexicon_path = str(lex)
 
         with tempfile.TemporaryDirectory(prefix="masktool_") as tmp:
             tmp_dir = Path(tmp)

@@ -20,10 +20,26 @@ PyInstaller 不能跨平台编译，Windows `.exe` 需要在 Windows 上另行�
 
 - 批量选择 `.docx` / `.pdf` / `.xlsx` / `.pptx`。
 - 选择 `strict` / `smart` / `aggressive` 三种脱敏模式，`smart` 为默认。
+- **用户词库**：界面可直接添加公司名、人名、项目名等自定义敏感词；支持从 TXT 批量导入，并随设置自动保存。
 - 输出目录默认与原文件相同，文件名自动追加 `_脱敏` 后缀。
 - 实时进度条、逐文件状态、处理完成后弹窗汇总。
 - 支持导出映射表，用于后续还原脱敏内容。
 - 支持双击结果行直接打开对应输出文件。
+
+## 用户词库（strict 模式的核心）
+
+| 模式 | 自动脱敏规则 |
+|------|------|
+| `strict` | 主要脱敏**词库匹配**（置信度 0.95）；金额、手机号等高置信度正则项也会被脱敏。 |
+| `smart` | 在词库基础上，叠加 jieba NER + 正则，适合日常办公。 |
+| `aggressive` | 降低阈值，最大化召回，可能误伤普通词。 |
+
+**建议**：把真实的公司全称、客户姓名、项目名称等维护到"用户词库"中，这样：
+- 切换 `strict` 模式时仍有稳定、可控的脱敏效果；
+- 所有模式下的脱敏结果都更精准；
+- 词库随设置自动保存，重启程序后仍在。
+
+> 词库匹配是**精确包含**（不是模糊匹配），因此建议填入完整名称，例如"北京云端科技有限公司"而不是"云端"。
 
 ## 关于 PDF
 
@@ -87,7 +103,12 @@ masktool-gui/
 ├── tools/
 │   └── make_icon.py   # 生成 assets/app.ico
 ├── assets/
-│   └── app.ico
+│   ├── app.ico
+│   ├── mask_tool_config/   # 内嵌的 mask-tool 默认词库与阈值配置
+│   │   ├── default.yaml
+│   │   ├── sample_lexicon.yaml
+│   │   └── whitelist.yaml
+│   └── version.txt
 ├── requirements.txt
 ├── masktool_gui.spec  # PyInstaller 配置
 ├── build.bat          # Windows 一键打包

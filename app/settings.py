@@ -17,6 +17,7 @@ DEFAULTS: dict[str, Any] = {
     "suffix_tag": "_脱敏",
     "mask_tool_path": "",         # 手动指定的 mask-tool 可执行文件
     "last_dir": "",
+    "user_lexicon": {},           # 用户自定义敏感词词库：{类别: [词...]}
 }
 
 
@@ -45,6 +46,19 @@ def load() -> dict[str, Any]:
                         data[k] = loaded[k]
     except (OSError, ValueError, TypeError):
         pass
+
+    # 用户词库：清洗为 {str: [str,...]}，剔除空值与非法值
+    raw_lex = data.get("user_lexicon")
+    if isinstance(raw_lex, dict):
+        clean: dict[str, list[str]] = {}
+        for cat, words in raw_lex.items():
+            if isinstance(cat, str) and isinstance(words, list):
+                vals = [w for w in words if isinstance(w, str) and w.strip()]
+                if vals:
+                    clean[cat] = vals
+        data["user_lexicon"] = clean
+    else:
+        data["user_lexicon"] = {}
     return data
 
 

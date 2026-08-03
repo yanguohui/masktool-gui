@@ -21,7 +21,7 @@ import threading
 import traceback
 from pathlib import Path
 from tkinter import (
-    BooleanVar, StringVar, Tk, filedialog, messagebox, ttk,
+    BooleanVar, Listbox, StringVar, Tk, filedialog, messagebox, ttk,
 )
 
 from app import settings
@@ -46,6 +46,17 @@ INSTALL_HELP = (
     "安装完成后点击“重新检测”。\n"
     "若已安装但仍无法识别，可点击“手动指定…”选择 mask-tool 可执行文件。"
 )
+
+# 用户词库类别：界面中文标签 -> mask-tool 词库类别键
+LEX_CATEGORIES = [
+    ("公司名", "company"),
+    ("人名", "person"),
+    ("项目名", "project"),
+    ("机构 / 单位", "government"),
+    ("地名", "location"),
+    ("金额", "amount"),
+    ("自定义", "custom"),
+]
 
 
 # --------------------------------------------------------------------------
@@ -135,8 +146,8 @@ class MaskApp:
 
     def _build_window(self) -> None:
         self.root.title(f"{APP_TITLE}  v{APP_VERSION}")
-        self.root.geometry("720x540")
-        self.root.minsize(660, 490)
+        self.root.geometry("740x660")
+        self.root.minsize(680, 600)
 
         style = ttk.Style()
         for theme in ("vista", "winnative", "clam"):
@@ -155,7 +166,7 @@ class MaskApp:
 
         # 居中
         self.root.update_idletasks()
-        w, h = 720, 540
+        w, h = 740, 660
         x = (self.root.winfo_screenwidth() - w) // 2
         y = (self.root.winfo_screenheight() - h) // 3
         self.root.geometry(f"{w}x{h}+{max(x,0)}+{max(y,0)}")
@@ -261,9 +272,12 @@ class MaskApp:
                                      command=self.pick_outdir)
         self.btn_outdir.grid(row=1, column=2)
 
+        # ---- 用户词库 ----
+        self._build_lexicon_widgets(outer)
+
         # ---- 进度与操作 ----
         foot = ttk.Frame(outer)
-        foot.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        foot.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         foot.columnconfigure(0, weight=1)
         foot.rowconfigure(1, minsize=34)
 
@@ -431,6 +445,185 @@ class MaskApp:
         self.ent_outdir.configure(state=state)
         self.btn_outdir.configure(state=state)
 
+    # -- 用户词库 ---------------------------------------------------------
+
+    def _build_lexicon_widgets(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(
+            parent, text=" 用户词库（strict 模式主要依赖此词典） ", padding=(8, 6)
+        )
+        frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        frame.columnconfigure(2, weight=1)
+
+        self.var_lex_cat = StringVar(value=LEX_CATEGORIES[0][0])
+        ttk.Label(frame, text="类别：").grid(row=0, column=0, sticky="w")
+        self.cmb_lex_cat = ttk.Combobox(
+            frame, textvariable=self.var_lex_cat, state="readonly",
+            values=[c[0] for c in LEX_CATEGORIES], width=12,
+        )
+        self.cmb_lex_cat.grid(row=0, column=1, sticky="w", padx=(0, 8))
+
+        self.PLACEHOLDER_LEX = "输入词，逗号分隔，回车添加"
+        self.ent_lex = ttk.Entry(frame, width=26)
+        self.ent_lex.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+        self.ent_lex.insert(0, self.PLACEHOLDER_LEX)
+        self.ent_lex.configure(foreground="#999999")
+        self.ent_lex.bind("<FocusIn>", self._lex_entry_focus_in)
+        self.ent_lex.bind("<FocusOut>", self._lex_entry_focus_out)
+        self.ent_lex.bind("<Return>", lambda e: self._add_lex_word())
+
+        ttk.Button(frame, text="添加", width=8,
+                   command=self._add_lex_word).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(frame, text="导入TXT", width=9,
+                   command=self._import_lex_txt).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(frame, text="清空", width=8,
+                   command=self._clear_lex).grid(row=0, column=5)
+
+        list_row = ttk.Frame(frame)
+        list_row.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(6, 0))
+        list_row.columnconfigure(0, weight=1)
+
+        self.lst_lex = Listbox(list_row, height=3, selectmode="extended",
+                               exportselection=False)
+        self.lst_lex.grid(row=0, column=0, sticky="nsew")
+        sb_lex = ttk.Scrollbar(list_row, orient="vertical",
+                               command=self.lst_lex.yview)
+        sb_lex.grid(row=0, column=1, sticky="ns")
+        self.lst_lex.configure(yscrollcommand=sb_lex.set)
+        self.lst_lex.bind("<Delete>", lambda e: self._remove_lex_selected())
+
+        self.lbl_lex_count = ttk.Label(list_row, text="已收录 0 个词",
+                                       style="Hint.TLabel")
+        self.lbl_lex_count.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(list_row, text="删除所选", width=10,
+                   command=self._remove_lex_selected).grid(
+            row=1, column=1, sticky="e", padx=(6, 0))
+
+        self._refresh_lex_list()
+
+    def _lex_cat_key(self) -> str:
+        label = self.var_lex_cat.get()
+        for lbl, key in LEX_CATEGORIES:
+            if lbl == label:
+                return key
+        return "custom"
+
+    def _lex_entry_focus_in(self, _e=None) -> None:
+        if self.ent_lex.get() == self.PLACEHOLDER_LEX:
+            self.ent_lex.delete(0, "end")
+            self.ent_lex.configure(foreground="#000000")
+
+    def _lex_entry_focus_out(self, _e=None) -> None:
+        if not self.ent_lex.get().strip():
+            self.ent_lex.insert(0, self.PLACEHOLDER_LEX)
+            self.ent_lex.configure(foreground="#999999")
+
+    @staticmethod
+    def _split_words(text: str) -> list[str]:
+        import re
+        parts = re.split(r"[\n,，、;；\t]+", text)
+        return [w.strip() for w in parts if w.strip()]
+
+    def _add_lex_word(self) -> None:
+        text = self.ent_lex.get().strip()
+        if not text or text == self.PLACEHOLDER_LEX:
+            return
+        cat = self._lex_cat_key()
+        words = self._split_words(text)
+        if not words:
+            return
+        current = self.cfg.setdefault("user_lexicon", {})
+        existing = list(current.get(cat, []))
+        added = 0
+        for w in words:
+            if w not in existing:
+                existing.append(w)
+                added += 1
+        if added:
+            current[cat] = existing
+            settings.save(self.cfg)
+            self._refresh_lex_list()
+        self.ent_lex.delete(0, "end")
+        self._lex_entry_focus_out()
+
+    def _import_lex_txt(self) -> None:
+        p = filedialog.askopenfilename(
+            title="导入词库（TXT，每行一个词）",
+            initialdir=self._initial_dir(),
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if not p:
+            return
+        try:
+            data = Path(p).read_text(encoding="utf-8", errors="ignore")
+        except OSError as exc:
+            messagebox.showerror("读取失败", f"无法读取文件：\n{exc}")
+            return
+        words = self._split_words(data)
+        if not words:
+            messagebox.showinfo("提示", "文件中没有可导入的词。")
+            return
+        cat = self._lex_cat_key()
+        current = self.cfg.setdefault("user_lexicon", {})
+        existing = list(current.get(cat, []))
+        added = 0
+        for w in words:
+            if w not in existing:
+                existing.append(w)
+                added += 1
+        if added:
+            current[cat] = existing
+            settings.save(self.cfg)
+            self._refresh_lex_list()
+        messagebox.showinfo(
+            "导入完成",
+            f"已导入 {added} 个新词到「{self.var_lex_cat.get()}」（当前共 {len(existing)} 个）。",
+        )
+
+    def _remove_lex_selected(self) -> None:
+        sel = self.lst_lex.curselection()
+        if not sel:
+            return
+        to_remove: list[tuple[str, str]] = []
+        label_to_key = {lbl: k for lbl, k in LEX_CATEGORIES}
+        for i in sel:
+            item = self.lst_lex.get(i)
+            if ":" in item:
+                cat_lbl, word = item.split(":", 1)
+                key = label_to_key.get(cat_lbl.strip())
+                if key:
+                    to_remove.append((key, word.strip()))
+        if not to_remove:
+            return
+        current = self.cfg.get("user_lexicon", {})
+        for key, word in to_remove:
+            if key in current and word in current[key]:
+                current[key].remove(word)
+                if not current[key]:
+                    del current[key]
+        settings.save(self.cfg)
+        self._refresh_lex_list()
+
+    def _clear_lex(self) -> None:
+        if not self.cfg.get("user_lexicon"):
+            return
+        if not messagebox.askyesno("确认清空", "确定要清空全部用户词库吗？"):
+            return
+        self.cfg["user_lexicon"] = {}
+        settings.save(self.cfg)
+        self._refresh_lex_list()
+
+    def _refresh_lex_list(self) -> None:
+        self.lst_lex.delete(0, "end")
+        total = 0
+        lex = self.cfg.get("user_lexicon", {})
+        label_of = {k: lbl for lbl, k in LEX_CATEGORIES}
+        for key, words in lex.items():
+            cat_lbl = label_of.get(key, key)
+            for w in words:
+                self.lst_lex.insert("end", f"{cat_lbl}: {w}")
+                total += 1
+        self.lbl_lex_count.configure(text=f"已收录 {total} 个词")
+
     def pick_outdir(self) -> None:
         d = filedialog.askdirectory(title="选择输出目录",
                                     initialdir=self.var_outdir.get() or self._initial_dir())
@@ -491,8 +684,14 @@ class MaskApp:
         self._set_running(True)
         self.pb.configure(maximum=len(self.files), value=0)
 
-        engine = self.engine
-        assert engine is not None
+        if self.tool is None:
+            messagebox.showerror("缺少脱敏核心", INSTALL_HELP)
+            return
+
+        # 用当前用户词库重建引擎（词库改动实时生效）
+        lex = self.cfg.get("user_lexicon") or {}
+        engine = MaskEngine(self.tool, user_lexicon=lex)
+        self.engine = engine
         files = list(self.files)
         suffix = self.cfg.get("suffix_tag") or "_脱敏"
 
@@ -548,7 +747,7 @@ class MaskApp:
     def _handle(self, kind: str, payload) -> None:
         if kind == "engine_ok":
             self.tool = payload
-            self.engine = MaskEngine(payload)
+            self.engine = MaskEngine(payload, user_lexicon=self.cfg.get("user_lexicon") or {})
             ver = f"  {payload.version}" if payload.version else ""
             self.lbl_engine.configure(text=f"✓ 已就绪{ver}", style="Ok.TLabel")
             self.btn_detect.configure(state="normal")
