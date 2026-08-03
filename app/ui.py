@@ -300,10 +300,11 @@ class MaskApp:
         )
         self.cmb_mode.set(MODE_LABELS.get(self.cfg["mode"], MODE_LABELS["smart"]))
         self.cmb_mode.grid(row=0, column=1, sticky="w", padx=(0, 8))
-        self.cmb_mode.bind("<<ComboboxSelected>>", lambda _e: self._sync_sens_state())
+        self.cmb_mode.bind("<<ComboboxSelected>>", lambda _e: self._sync_mode_dependent())
 
-        # ---- 检测灵敏度（smart / aggressive） ----
-        ttk.Label(opt, text="检测灵敏度：").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        # ---- 检测灵敏度（仅 smart 模式可见/生效） ----
+        self.lbl_sens_title = ttk.Label(opt, text="检测灵敏度：")
+        self.lbl_sens_title.grid(row=1, column=0, sticky="w", pady=(6, 0))
         sens_row = ttk.Frame(opt)
         sens_row.grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
         self.var_sens = StringVar(value=self.cfg.get("sensitivity") or SENSITIVITY_DEFAULT)
@@ -324,6 +325,8 @@ class MaskApp:
             opt, text="", style="Hint.TLabel", wraplength=660, justify="left",
         )
         self.lbl_sens_desc.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        # 这三个控件仅在 smart 模式下显示，由 _sync_mode_dependent 控制
+        self._sens_widgets = [self.lbl_sens_title, sens_row, self.lbl_sens_desc]
 
         self.var_mapping = BooleanVar(value=bool(self.cfg["save_mapping"]))
         ttk.Checkbutton(opt, text="导出映射表（用于还原）",
@@ -380,7 +383,7 @@ class MaskApp:
         self.btn_run.pack(side="left")
 
         self._sync_out_state()
-        self._sync_sens_state()
+        self._sync_mode_dependent()
 
     def _bind_events(self) -> None:
         self.tree.bind("<Double-1>", self._on_double_click)
@@ -527,21 +530,24 @@ class MaskApp:
         key = self.var_sens.get()
         self.cfg["sensitivity"] = key
         settings.save(self.cfg)
-        self._sync_sens_state()
+        self._sync_mode_dependent()
 
-    def _sync_sens_state(self) -> None:
-        """灵敏度仅对 smart / aggressive 生效，strict 下禁用并提示。"""
-        key = self.var_sens.get()
-        strict = self._current_mode() == "strict"
-        state = "disabled" if strict else "normal"
-        for rb in self._sens_radios:
-            rb.configure(state=state)
-        if strict:
-            self.lbl_sens_desc.configure(
-                text="strict 模式仅使用用户词库，检测灵敏度设置不生效。")
-        else:
+    def _sync_mode_dependent(self) -> None:
+        """根据当前模式联动灵敏度控件的可见性与说明。
+
+        检测灵敏度仅对 smart 模式有意义：strict 只用用户词库、aggressive
+        已是最高召回，因此这两种模式下隐藏灵敏度设置，避免误导。
+        """
+        smart = self._current_mode() == "smart"
+        if smart:
+            for w in self._sens_widgets:
+                w.grid()
+            key = self.var_sens.get()
             lvl = SENSITIVITY_LEVELS.get(key, SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT])
             self.lbl_sens_desc.configure(text=lvl["desc"])
+        else:
+            for w in self._sens_widgets:
+                w.grid_remove()
 
     # -- 用户词库 ---------------------------------------------------------
 

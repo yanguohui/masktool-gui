@@ -26,6 +26,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -158,53 +159,54 @@ MODE_LABELS: dict[str, str] = {
 }
 
 # --------------------------------------------------------------------------
-# smart / aggressive 模式的「检测灵敏度」
+# smart 模式的「检测灵敏度」（仅 smart 模式可见/生效）
 # --------------------------------------------------------------------------
-# 问题根源：mask-tool 中 AUTO_MASK 与 SUGGEST_MASK 的结果都会被实际替换，
-# 因此真正决定"是否脱敏"的阈值是 suggest_mask；而原 smart 默认
-# suggest_mask=0.55 过低，导致 jieba NER 把"新建""中华民族""系统安全"
-# 这类普通词语（置信度约 0.60~0.75）也当成实体脱敏，误伤很多。
-#
-# 这里把检测能力拆成两类区别对待：
-#   · 词库匹配（lexicon）+ 正则类（手机/身份证/邮箱/金额/IP/MAC/日期）：
-#     置信度高、误报少，无论灵敏度如何都照常脱敏；
-#   · NER（人名/机构/地名等智能识别项）：置信度偏低、误报多，按用户
-#     选择的灵敏度阈值裁剪 —— 这才是"灵敏度"真正调节的对象。
-#
-# 每个档位给出 ner_auto / ner_suggest 两个阈值（>=auto 自动脱敏，
-# >=suggest 建议脱敏，二者都会被替换）；regex 下限固定，保证高置信
-# 信息不被灵敏度误关。
+# 设计要点：
+#   · 词库匹配（lexicon）、正则（手机/身份证/邮箱/金额/IP/MAC/日期/中文金额/
+#     项目工程名）属于高置信信息，无论灵敏度如何都照常脱敏（见 _patch_policy）。
+#   · jieba NER 的置信度上限仅 0.85，且「人名/机构/地名」的置信度分布差异很大：
+#       机构名（company）几乎都在 0.83 左右，可靠；
+#       人名（person）多在 0.60~0.70，偏低的真名与偏高的误报并存；
+#       地名（location）误报极多（"大海""新建"等都被误标），不可信；
+#       其他专名（custom，nz）鱼龙混杂。
+#     因此「灵敏度」按实体类型分别设阈值，而非一刀切：
+#       - company 阈值最低（最可靠），person 次之，custom 较严，location 最严。
+#   · 同时用一份「常见误报白名单」把 jieba 常误标为实体的非敏感词
+#     （严格遵守/中华民族/系统安全/新建…）排除在脱敏之外，
+#     这样即便调低 person/custom 阈值，也不会重新误伤这些普通词。
+#   · 项目名、客户名若未被 NER 命中，最稳妥的方式仍是加入「用户词库」。
 
+# 每个档位给出「按实体类型」的 NER 阈值（confidence >= 阈值才脱敏）。
+# aggressive 模式等价于 high 档（尽可能高召回）。
 SENSITIVITY_LEVELS: dict[str, dict] = {
     "high": {
         "label": "高（激进召回）",
-        "ner_auto": 0.66, "ner_suggest": 0.55,
+        "thr": {"company": 0.55, "person": 0.55, "custom": 0.55, "location": 0.55},
         "desc": (
-            "几乎不漏掉任何疑似信息：人名/机构/地名等智能识别项全部参与脱敏。"
-            "代价是误伤最多，普通词语如「新建」「中华民族」「系统安全」也常被"
-            "误判为敏感。仅在宁可错杀、事后人工复核的场景使用。"
+            "几乎不漏掉任何疑似信息：人名 / 机构 / 地名等智能识别项全部参与脱敏。"
+            "代价是误伤最多，普通词语也常被误判为敏感。仅在宁可错杀、事后人工复核的场景使用。"
         ),
     },
     "medium": {
         "label": "中（推荐）",
-        "ner_auto": 0.85, "ner_suggest": 0.78,
+        "thr": {"company": 0.60, "person": 0.64, "custom": 0.68, "location": 0.78},
         "desc": (
-            "平衡之选：手机、身份证、邮箱、金额、IP、MAC 等高置信信息照常脱敏；"
-            "仅压制低置信的 NER 误报，大幅减少「新建」「严格遵守」这类误伤，"
-            "同时保留较长、带实体后缀的真实机构名与人名。"
+            "平衡之选：手机、身份证、邮箱、金额、IP、MAC、日期、中文金额、项目/工程名等"
+            "高置信信息照常脱敏；机构名、人名（含客户/联系人姓名）基本都能命中；"
+            "仅压制低置信的地名误报。常见非敏感词（严格遵守/中华民族/系统安全/新建…）已加入白名单不再误伤。"
         ),
     },
     "low": {
         "label": "低（保守精准）",
-        "ner_auto": 0.90, "ner_suggest": 0.85,
+        "thr": {"company": 0.75, "person": 0.72, "custom": 0.78, "location": 0.85},
         "desc": (
-            "只脱敏置信度很高的智能识别项（≥0.85，多为真实机构名、长专有名词），"
-            "几乎不误伤普通词语；短人名等需依赖用户词库或 strict 模式保障。"
+            "只脱敏置信度较高的智能识别项（多为真实机构名、长专有名词），几乎不误伤普通词语；"
+            "短人名、部分客户名可能漏掉，建议配合「用户词库」或 strict 模式。"
         ),
     },
     "minimal": {
         "label": "极低（审慎）",
-        "ner_auto": 0.95, "ner_suggest": 0.92,
+        "thr": {"company": 0.85, "person": 0.82, "custom": 0.88, "location": 0.90},
         "desc": (
             "仅处理最高置信的少量项，误伤最少；适合对误报零容忍、宁可漏掉的场合。"
             "智能识别基本只保留用户词库匹配项。"
@@ -214,26 +216,82 @@ SENSITIVITY_LEVELS: dict[str, dict] = {
 SENSITIVITY_KEYS: tuple[str, ...] = ("high", "medium", "low", "minimal")
 SENSITIVITY_DEFAULT = "medium"
 
+#: aggressive 模式使用与 high 相同的「尽可能高召回」阈值
+_AGGRESSIVE_THR: dict[str, float] = dict(SENSITIVITY_LEVELS["high"]["thr"])
+
 #: 正则类（高精度）始终脱敏的下限，与灵敏度无关
 _REGEX_AUTO = 0.70
 _REGEX_SUGGEST = 0.55
 
-#: 当前生效的灵敏度（由 UI 在每次处理前设置）
-_SMART_SENSITIVITY = dict(SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT])
+#: 当前生效的 smart 灵敏度阈值（由 UI 在每次处理前设置）
+_SMART_THR: dict[str, float] = dict(SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT]["thr"])
 
 
 def set_smart_sensitivity(key: str) -> None:
-    """切换当前生效的检测灵敏度（影响后续 smart/aggressive 处理）。"""
-    global _SMART_SENSITIVITY
-    _SMART_SENSITIVITY = dict(SENSITIVITY_LEVELS.get(key, SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT]))
+    """切换当前生效的 smart 检测灵敏度（影响后续 smart 处理）。"""
+    global _SMART_THR
+    lvl = SENSITIVITY_LEVELS.get(key, SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT])
+    _SMART_THR = dict(lvl["thr"])
+
+
+def _ner_threshold(text_type) -> float:
+    """把 DetectionType 映射到当前灵敏度下的阈值。"""
+    name = getattr(text_type, "value", str(text_type)).lower()
+    if name in ("company", "government"):
+        return _SMART_THR["company"]
+    if name == "person":
+        return _SMART_THR["person"]
+    if name == "location":
+        return _SMART_THR["location"]
+    return _SMART_THR["custom"]
+
+
+def _patch_detector_rules() -> None:
+    """给 mask-tool 的检测器补充高置信正则（幂等）。
+
+    解决两类原版漏检：
+      1) 阿拉伯数字金额必须带「万/亿」才被识别（"1,200,000元" 漏检）；
+         新增「纯数字+元」规则。
+      2) 中文大写金额（陆拾万元/壹佰万元）与「X项目/X工程」这类项目名
+         原版完全不识别；新增对应正则，作为高置信项始终脱敏。
+    """
+    try:
+        from mask_tool.core.detector import Detector
+        from mask_tool.models.detection import DetectionType
+
+        if getattr(Detector, "_patched_rules_by_engine", False):
+            return
+
+        _orig = Detector._build_regex_rules  # type: ignore[assignment]
+
+        def _build(self):  # noqa: ANN001
+            rules = _orig(self)
+            extra = [
+                # 阿拉伯数字金额（含「元」但不带万/亿，如 1,200,000元 / 500元）
+                (re.compile(r"[\d,]+\.?\d*元"), DetectionType.AMOUNT, 0.80),
+                # 中文大写金额：陆拾万元 / 壹佰万元 / 伍仟元 / 十亿
+                # 注意：前导数字不含「万/亿」，且整体须以 元/圆/万/亿 收尾，
+                # 避免把「一个」「十」之类的普通词误判为金额。
+                (re.compile(r"[零〇一二三四五六七八九十百千壹贰叁肆伍陆柒捌玖拾佰仟]+(?:[万亿]?元|[万亿]?圆|万|亿)"),
+                 DetectionType.AMOUNT, 0.85),
+                # 项目 / 工程名（以「项目」「工程」结尾的专有名词短语）
+                (re.compile(r"[一-鿿]{2,}(?:项目|工程)"), DetectionType.PROJECT, 0.85),
+            ]
+            return rules + extra
+
+        Detector._build_regex_rules = _build  # type: ignore[assignment]
+        Detector._patched_rules_by_engine = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 
 def _patch_policy() -> None:
     """对 mask-tool 的 PolicyEngine 打补丁（幂等）。
 
-    仅对 smart / aggressive 模式生效：词库与正则高置信项始终脱敏，
-    NER 项按用户灵敏度阈值裁剪，从而在不影响手机/身份证/邮箱/金额等
-    高价值信息脱敏的前提下，抑制智能识别的误伤。
+    仅对 smart / aggressive 模式生效：
+      · 词库与正则（含本项目补充的高置信正则）始终脱敏；
+      · NER 项按「实体类型 × 用户灵敏度」阈值裁剪，机构名/人名更宽松、
+        地名更严格，从而在尽量少误伤的前提下覆盖真实的客户名/项目名/金额。
     """
     try:
         from mask_tool.core.policy import PolicyEngine
@@ -254,20 +312,24 @@ def _patch_policy() -> None:
                     return DetectionStatus.AUTO_MASK if conf >= 0.95 \
                         else DetectionStatus.HINT_ONLY
                 if src == "regex":
-                    # 高置信正则（手机/身份证/邮箱/金额/IP/MAC/日期）始终脱敏
+                    # 高置信正则（手机/身份证/邮箱/金额/IP/MAC/日期/中文金额/项目名）始终脱敏
                     if conf >= _REGEX_AUTO:
                         return DetectionStatus.AUTO_MASK
                     if conf >= _REGEX_SUGGEST:
                         return DetectionStatus.SUGGEST_MASK
                     return DetectionStatus.HINT_ONLY
-                # NER（及未知来源）：按用户灵敏度裁剪，避免误伤普通词语
-                a = _SMART_SENSITIVITY["ner_auto"]
-                s = _SMART_SENSITIVITY["ner_suggest"]
-                if conf >= a:
-                    return DetectionStatus.AUTO_MASK
-                if conf >= s:
-                    return DetectionStatus.SUGGEST_MASK
-                return DetectionStatus.HINT_ONLY
+                # NER（及未知来源）：按实体类型 × 灵敏度裁剪
+                thr = _AGGRESSIVE_THR if mode == "aggressive" else _SMART_THR
+                name = getattr(result.text_type, "value", str(result.text_type)).lower()
+                if name in ("company", "government"):
+                    t = thr["company"]
+                elif name == "person":
+                    t = thr["person"]
+                elif name == "location":
+                    t = thr["location"]
+                else:
+                    t = thr["custom"]
+                return DetectionStatus.AUTO_MASK if conf >= t else DetectionStatus.HINT_ONLY
             # strict / focused 等模式沿用上游原始逻辑
             return _orig_decide(self, result)
 
@@ -660,6 +722,8 @@ class MaskEngine:
             from mask_tool.models.detection import DetectionStatus
             # 修复上游 docx 多实体替换串扰缺陷
             _patch_mask_tool_adapters()
+            # 补充高置信正则（中文金额 / 项目工程名 / 纯数字金额）
+            _patch_detector_rules()
             # 注入「检测灵敏度」可控的 smart/aggressive 策略
             _patch_policy()
             return (Pipeline, MaskConfig, DetectionStatus)
