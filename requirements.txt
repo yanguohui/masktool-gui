@@ -1,0 +1,10 @@
+# ===== 打包工具 =====
+pyinstaller>=6.0
+packaging
+
+# ===== 脱敏核心 mask-tool =====
+# 该库尚未发布到 PyPI，需从 GitHub 安装。
+# 已固定到本地验证通过的提交，保证 Actions 构建结果一致。
+# 安装后 PyInstaller 会把它整体打包进 exe（见 masktool_gui.spec），
+# 最终用户无需单独安装 mask-tool。
+mask-tool @ git+https://github.com/ZagooYWX/mask-tool.git@e39f04765e7f5ab705826f41d60003629f3cea8a

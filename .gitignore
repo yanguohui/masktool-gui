@@ -1,0 +1,19 @@
+# ===== 构建产物（由 Actions / build.bat 生成，无需入库）=====
+dist/
+build/
+build-venv/
+*.spec.bak
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+.venv/
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.vscode/
+.DS_Store
+.AppleDouble
+Thumbs.db

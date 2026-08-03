@@ -1,0 +1,47 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout GUI repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build icon and EXE
+        shell: cmd
+        run: |
+          python -m venv build-venv
+          call build-venv\Scripts\activate.bat
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python tools\make_icon.py
+          python -m PyInstaller --noconfirm --clean masktool_gui.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 本地文档脱敏工具-Windows
+          path: dist/本地文档脱敏工具.exe
+
+      - name: Release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/本地文档脱敏工具.exe
+          generate_release_notes: true

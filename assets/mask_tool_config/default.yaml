@@ -1,0 +1,52 @@
+# 脱敏模式: strict / smart / aggressive
+mode: smart
+
+# 置信度阈值
+thresholds:
+  # 本地化调优：mask-tool 默认 0.85 过高，导致 jieba NER 识别出的人名(约0.65)
+  # 只能"建议脱敏"而不会被自动替换。下调到 0.66 让人名等实体自动脱敏；
+  # 同时略高于地名(约0.63)，避免"人名+地名"相邻实体同时脱敏时
+  # 触发底层适配器的跨 run 替换串扰。如需更保守可调回 0.85。
+  auto_mask: 0.66      # >= 此值自动脱敏
+  suggest_mask: 0.55   # >= 此值建议脱敏
+  # < 0.55 仅提示
+
+# OCR配置（MVP阶段暂不启用）
+ocr:
+  enabled: false
+  engine: paddleocr    # paddleocr / tesseract
+
+# NER配置
+ner:
+  enabled: true            # 启用NER智能识别
+  engine: jieba            # jieba（轻量）/ hanlp（高精度，需额外安装）
+
+# 存储配置
+storage:
+  mapping_format: json  # json / sqlite
+  encrypt_mapping: false
+
+# 词库路径
+# sample_lexicon.yaml 是随项目分发的通用示例词库
+# lexicon.yaml 是用户自定义词库（不会提交到GitHub）
+# 如果 lexicon.yaml 不存在，自动从 sample_lexicon.yaml 复制创建
+lexicon_path: config/lexicon.yaml
+
+# 白名单路径
+whitelist_path: config/whitelist.yaml
+
+# 性能配置
+performance:
+  workers: 4
+  max_file_mb: 500
+
+# 脱敏类别（按优先级排序）
+categories:
+  - company
+  - government
+  - person
+  - project
+  - subject
+  - location
+  - amount
+  - custom
