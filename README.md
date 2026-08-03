@@ -45,12 +45,13 @@ git clone <本仓库地址>
 cd masktool-gui
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e <mask-tool 仓库路径>
-pip install pyinstaller
-python3 -m PyInstaller --noconfirm --clean masktool_gui.spec
+pip install -r requirements.txt
+python3 -m PyInstaller --noconfirm masktool_gui.spec
 ```
 
-打包完成后会在 `dist/` 下生成单文件可执行程序 `本地文档脱敏工具`。
+`requirements.txt` 已包含 `pyinstaller` 与 `mask-tool`（从 GitHub 安装），
+无需再手动安装脱敏引擎。打包完成后会在 `dist/` 下生成单文件可执行程序
+`本地文档脱敏工具`。
 
 ### Windows
 
