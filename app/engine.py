@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
@@ -461,6 +462,34 @@ def is_whitelisted(text: str, whitelist: frozenset[str] | set[str] | None = None
     if not wl:
         return False
     return bool(_wl_normalize(text) & set(wl))
+
+
+def save_whitelist(words: Iterable[str]) -> bool:
+    """将白名单词集写回 ``whitelist.txt``（每行一词）。返回是否写入成功。
+
+    GUI 的「白名单…」编辑器调用此函数。成功后会强制刷新文件指纹缓存，
+    下一次脱敏立即生效。写入失败（如程序装在只读目录）返回 ``False``，
+    不影响主流程。
+    """
+    p = whitelist_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        ordered = sorted(
+            {w.strip() for w in words if w and w.strip()},
+            key=lambda s: (len(s), s),
+        )
+        header = (
+            "# 白名单 —— 写在这里的词「绝不脱敏」\n"
+            "# 一行一个词；保存后无需重启，下一次脱敏自动生效。\n"
+            "# 程序自动忽略「本/该/此」等前缀与结尾的「的」，故「工程」即可保护「本工程」。\n"
+            "# -------------------------------------------------------------------------\n\n"
+        )
+        body = "\n".join(ordered)
+        p.write_text(header + body + ("\n" if body else ""), encoding="utf-8")
+    except OSError:
+        return False
+    load_whitelist(force=True)
+    return True
 
 
 # --------------------------------------------------------------------------

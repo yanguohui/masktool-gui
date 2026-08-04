@@ -31,6 +31,7 @@ from app.engine import (
     MODE_LABELS, MODES, REPORT_ONLY_EXTS, SUPPORTED_EXTS,
     SENSITIVITY_LEVELS, SENSITIVITY_KEYS, SENSITIVITY_DEFAULT,
     FileResult, MaskEngine, MaskToolNotFound, ToolInfo, locate_mask_tool,
+    load_whitelist, save_whitelist,
     set_min_confidence, set_ner_backend, ner_status,
 )
 
@@ -238,14 +239,16 @@ class MaskApp:
         bar.columnconfigure(1, weight=1)
 
         ttk.Label(bar, text="脱敏核心：").grid(row=0, column=0, sticky="w")
-        self.lbl_engine = ttk.Label(bar, text="正在检测…", style="Hint.TLabel")
+        self.lbl_engine = ttk.Label(bar, text="正在检测…", style="Hint.TLabel",
+                                    cursor="hand2")
         self.lbl_engine.grid(row=0, column=1, sticky="w")
+        self.lbl_engine.bind("<Button-1>", self._engine_popup)
         self.btn_detect = ttk.Button(bar, text="重新检测", width=10,
                                      command=self.detect_engine)
         self.btn_detect.grid(row=0, column=2, padx=(6, 0))
-        self.btn_locate = ttk.Button(bar, text="手动指定…", width=11,
-                                     command=self.pick_tool_path)
-        self.btn_locate.grid(row=0, column=3, padx=(6, 0))
+        self.btn_whitelist = ttk.Button(bar, text="白名单…", width=11,
+                                        command=self.open_whitelist_editor)
+        self.btn_whitelist.grid(row=0, column=3, padx=(6, 0))
 
         # ---- 文件列表 ----
         box = ttk.LabelFrame(outer, text=" 待处理文件 ", padding=(8, 6))
@@ -422,6 +425,127 @@ class MaskApp:
             self.cfg["mask_tool_path"] = p
             settings.save(self.cfg)
             self.detect_engine()
+
+    # 点击「脱敏核心」状态标签弹出的小菜单：保留「手动指定路径」入口
+    def _engine_popup(self, event: tk.Event | None = None) -> None:
+        if getattr(self, "_engine_menu_inst", None) is None:
+            m = tk.Menu(self.root, tearoff=0)
+            m.add_command(label="重新检测脱敏核心", command=self.detect_engine)
+            m.add_separator()
+            m.add_command(label="手动指定 mask-tool 路径…", command=self.pick_tool_path)
+            self._engine_menu_inst = m
+        menu = self._engine_menu_inst
+        try:
+            x = event.x_root if event else self.root.winfo_pointerx()
+            y = event.y_root if event else self.root.winfo_pointery()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    # -- 白名单编辑器（右上角「白名单…」按钮）-------------------------------
+
+    def open_whitelist_editor(self) -> None:
+        """打开白名单管理窗口：增删「绝不脱敏」的词，保存后立即生效。"""
+        win = tk.Toplevel(self.root)
+        win.title("白名单管理 — 绝不脱敏的词")
+        win.geometry("440x480")
+        win.minsize(380, 380)
+        win.transient(self.root)
+        win.grab_set()
+
+        items: list[str] = sorted(load_whitelist(force=True),
+                                  key=lambda s: (len(s), s))
+        fam, size = ui_font()
+
+        frm = ttk.Frame(win, padding=(10, 10, 10, 10))
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            frm,
+            text="以下词条在处理时「绝不脱敏」（按整条识别结果精确匹配）：",
+            style="Hint.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
+
+        listbox = tk.Listbox(frm, selectmode="extended", font=(fam, size))
+        listbox.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=6, pady=(0, 6))
+        sb = ttk.Scrollbar(frm, orient="vertical", command=listbox.yview)
+        sb.grid(row=1, column=2, sticky="ns", pady=(0, 6))
+        listbox.configure(yscrollcommand=sb.set)
+        for w in items:
+            listbox.insert("end", w)
+
+        def refresh() -> None:
+            listbox.delete(0, "end")
+            for w in sorted(set(items), key=lambda s: (len(s), s)):
+                listbox.insert("end", w)
+
+        # 添加区
+        add_frm = ttk.Frame(frm)
+        add_frm.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        add_frm.columnconfigure(0, weight=1)
+        ent = ttk.Entry(add_frm)
+        ent.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ent.focus_set()
+
+        def do_add() -> None:
+            raw = ent.get().strip()
+            if not raw:
+                return
+            for part in re.split(r"[,，、;；\s]+", raw):
+                part = part.strip()
+                if part and part not in items:
+                    items.append(part)
+            ent.delete(0, "end")
+            refresh()
+            ent.focus_set()
+
+        ent.bind("<Return>", lambda _e: do_add())
+        ttk.Button(add_frm, text="添加", width=8, command=do_add).grid(
+            row=0, column=1)
+
+        # 底部按钮：删除 / 取消 / 保存
+        btn_frm = ttk.Frame(frm)
+        btn_frm.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        btn_frm.columnconfigure(0, weight=1)
+        btn_frm.columnconfigure(1, weight=1)
+        btn_frm.columnconfigure(2, weight=1)
+
+        def do_del() -> None:
+            for i in reversed(list(listbox.curselection())):
+                items.remove(listbox.get(i))
+            refresh()
+
+        ttk.Button(btn_frm, text="删除所选", width=12,
+                   command=do_del).grid(row=0, column=0, padx=(0, 4), sticky="w")
+        ttk.Button(btn_frm, text="取消", width=10,
+                   command=win.destroy).grid(row=0, column=1, padx=(0, 4))
+
+        def do_save() -> None:
+            ok = save_whitelist(items)
+            if not ok:
+                messagebox.showerror(
+                    "保存失败",
+                    "无法写入 whitelist.txt（可能程序目录为只读）。",
+                    parent=win,
+                )
+                return
+            load_whitelist(force=True)
+            if getattr(self, "engine", None) is not None:
+                try:
+                    self.engine.refresh_whitelist()
+                except Exception:
+                    pass
+            messagebox.showinfo(
+                "已保存",
+                f"白名单已更新，共 {len(set(items))} 条。下次脱敏自动生效。",
+                parent=win,
+            )
+            win.destroy()
+
+        ttk.Button(btn_frm, text="保存", width=10, style="Run.TButton",
+                   command=do_save).grid(row=0, column=2, sticky="e")
 
     # -- 文件管理 ---------------------------------------------------------
 
@@ -1013,7 +1137,7 @@ class MaskApp:
     def _set_running(self, running: bool) -> None:
         self.running = running
         state = "disabled" if running else "normal"
-        for w in (self.btn_run, self.btn_detect, self.btn_locate, self.cmb_mode):
+        for w in (self.btn_run, self.btn_detect, self.btn_whitelist, self.cmb_mode):
             w.configure(state="disabled" if running else
                         ("readonly" if w is self.cmb_mode else "normal"))
         self.btn_cancel.configure(state="normal" if running else "disabled")
