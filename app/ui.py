@@ -31,6 +31,7 @@ from app.engine import (
     MODE_LABELS, MODES, REPORT_ONLY_EXTS, SUPPORTED_EXTS,
     SENSITIVITY_LEVELS, SENSITIVITY_KEYS, SENSITIVITY_DEFAULT,
     FileResult, MaskEngine, MaskToolNotFound, ToolInfo, locate_mask_tool,
+    set_min_confidence, set_ner_backend, ner_status,
 )
 
 APP_TITLE = "本地文档脱敏工具"
@@ -352,12 +353,15 @@ class MaskApp:
                                      command=self.pick_outdir)
         self.btn_outdir.grid(row=1, column=2)
 
+        # ---- 识别引擎（高级） ----
+        self._build_engine_widgets(outer)
+
         # ---- 用户词库 ----
         self._build_lexicon_widgets(outer)
 
         # ---- 进度与操作 ----
         foot = ttk.Frame(outer)
-        foot.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        foot.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         foot.columnconfigure(0, weight=1)
         foot.rowconfigure(1, minsize=34)
 
@@ -549,13 +553,130 @@ class MaskApp:
             for w in self._sens_widgets:
                 w.grid_remove()
 
+    # -- 识别引擎（高级） -------------------------------------------------
+
+    def _build_engine_widgets(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(
+            parent, text=" 识别引擎（高级） ", padding=(8, 6)
+        )
+        frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+
+        # NER 后端选择
+        # ttk.Combobox 不支持 value/label 分离，这里让 textvariable 直接保存
+        # 显示文案，再经由 _NER_DISPLAY_TO_KEY 映射回后端键。
+        self._NER_DISPLAY = {
+            "auto": "自动（优先 spaCy）",
+            "spacy": "spaCy（领域模型）",
+            "jieba": "jieba（默认）",
+        }
+        self._NER_DISPLAY_TO_KEY = {v: k for k, v in self._NER_DISPLAY.items()}
+        _saved = self.cfg.get("ner_backend", "auto")
+        self.var_ner_backend = StringVar(
+            value=self._NER_DISPLAY.get(_saved, self._NER_DISPLAY["auto"]))
+        ttk.Label(frame, text="识别引擎：").grid(
+            row=0, column=0, sticky="w", pady=(2, 0))
+        self.cmb_ner = ttk.Combobox(
+            frame, textvariable=self.var_ner_backend, state="readonly",
+            values=list(self._NER_DISPLAY.values()), width=22,
+        )
+        self.cmb_ner.grid(row=0, column=1, sticky="w", padx=(0, 8),
+                          pady=(2, 0))
+        self.cmb_ner.bind("<<ComboboxSelected>>",
+                          lambda _e: self._on_ner_change())
+
+        # spaCy 模型路径（留空=自动发现 models/ 与已安装模型）
+        ttk.Label(frame, text="spaCy 模型：").grid(
+            row=1, column=0, sticky="w", pady=(4, 0))
+        pathrow = ttk.Frame(frame)
+        pathrow.grid(row=1, column=1, columnspan=3, sticky="ew",
+                     pady=(4, 0))
+        pathrow.columnconfigure(0, weight=1)
+        self.var_spacy_model = StringVar(
+            value=self.cfg.get("spacy_model", ""))
+        self.ent_spacy = ttk.Entry(pathrow, textvariable=self.var_spacy_model)
+        self.ent_spacy.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.btn_spacy = ttk.Button(pathrow, text="浏览…", width=8,
+                                    command=self.pick_spacy_model)
+        self.btn_spacy.grid(row=0, column=1)
+
+        # 全局置信度下限
+        ttk.Label(frame, text="置信度下限：").grid(
+            row=2, column=0, sticky="w", pady=(4, 0))
+        self.var_min_conf = StringVar(
+            value=str(self.cfg.get("min_confidence", 0.8)))
+        sb = ttk.Spinbox(
+            frame, from_=0.0, to=1.0, increment=0.05,
+            textvariable=self.var_min_conf, width=8,
+        )
+        sb.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
+        ttk.Label(frame,
+                  text="仅脱敏置信度 ≥ 此值的识别结果（0~1）",
+                  style="Hint.TLabel").grid(
+            row=2, column=2, columnspan=2, sticky="w", pady=(4, 0))
+
+        # 引擎实时状态
+        self.lbl_ner_status = ttk.Label(
+            frame, text="", style="Hint.TLabel", wraplength=680,
+            justify="left")
+        self.lbl_ner_status.grid(row=3, column=0, columnspan=4,
+                                 sticky="w", pady=(4, 0))
+        self._refresh_ner_status()
+
+    def _on_ner_change(self) -> None:
+        self._refresh_ner_status()
+
+    def _ner_backend_key(self) -> str:
+        """从下拉显示文案映射回后端键（auto/spacy/jieba）。"""
+        return self._NER_DISPLAY_TO_KEY.get(
+            self.var_ner_backend.get(), "auto")
+
+    def _min_conf_value(self) -> float:
+        """解析置信度下限输入框，非法或越界时回退默认 0.8。"""
+        try:
+            v = float(self.var_min_conf.get().strip())
+        except (ValueError, AttributeError):
+            return 0.8
+        return min(max(v, 0.0), 1.0)
+
+    def _refresh_ner_status(self) -> None:
+        try:
+            st = ner_status()
+        except Exception:
+            self.lbl_ner_status.configure(text="引擎状态：未知")
+            return
+        active = st.get("active", "jieba")
+        model = st.get("model") or "（自动发现）"
+        if active == "spacy":
+            txt = f"当前识别引擎：spaCy（模型 {model}）"
+            self.lbl_ner_status.configure(text=txt)
+        else:
+            reason = st.get("reason") or ""
+            txt = f"当前识别引擎：jieba（内置）"
+            if reason:
+                txt += f"  · spaCy：{reason}"
+            self.lbl_ner_status.configure(text=txt)
+
+    def pick_spacy_model(self) -> None:
+        p = filedialog.askdirectory(
+            title="选择 spaCy 模型目录（含 config.cfg / meta.json）",
+            initialdir=self._initial_dir(),
+        )
+        if not p:
+            return
+        self.var_spacy_model.set(p)
+        self.ent_spacy.delete(0, "end")
+        self.ent_spacy.insert(0, p)
+        self._refresh_ner_status()
+
     # -- 用户词库 ---------------------------------------------------------
 
     def _build_lexicon_widgets(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(
             parent, text=" 用户词库（strict 模式主要依赖此词典） ", padding=(8, 6)
         )
-        frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         frame.columnconfigure(2, weight=1)
 
         self.var_lex_cat = StringVar(value=LEX_CATEGORIES[0][0])
@@ -818,14 +939,26 @@ class MaskApp:
         outdir = Path(self.var_outdir.get().strip()) if custom else None
         sensitivity = self.var_sens.get() or SENSITIVITY_DEFAULT
 
+        ner_backend = self._ner_backend_key()
+        spacy_model = self.var_spacy_model.get().strip()
+        min_conf = self._min_conf_value()
+
         self.cfg.update({
             "mode": mode,
             "sensitivity": sensitivity,
             "output_mode": self.var_outmode.get(),
             "custom_output": self.var_outdir.get().strip(),
             "save_mapping": save_mapping,
+            "ner_backend": ner_backend,
+            "spacy_model": spacy_model,
+            "min_confidence": min_conf,
         })
         settings.save(self.cfg)
+
+        # 引擎构造前先落地全局开关，_init_inproc 注入补丁时即可读到；
+        # 置信度下限是调用时读取，这里同样提前设置以保证一致。
+        set_ner_backend(ner_backend, spacy_model)
+        set_min_confidence(min_conf)
 
         # 重置列表状态
         self.results.clear()
@@ -858,6 +991,9 @@ class MaskApp:
                     save_mapping=save_mapping,
                     suffix_tag=suffix,
                     sensitivity=sensitivity,
+                    min_confidence=min_conf,
+                    ner_backend=ner_backend,
+                    spacy_model=spacy_model,
                     on_progress=lambda i, n, p: self.msg_q.put(("progress", (i, n, p))),
                     on_result=lambda r: self.msg_q.put(("result", r)),
                 )

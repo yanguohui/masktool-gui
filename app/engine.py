@@ -232,6 +232,238 @@ _SMART_THR: dict[str, float] = dict(SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT]["thr
 
 
 # --------------------------------------------------------------------------
+# 全局置信度下限：低于此值的识别结果一律「只提示、不替换」
+# --------------------------------------------------------------------------
+# 这是一道**凌驾于灵敏度档位之上**的硬闸门，对 dictionary / regex / ner
+# 全部来源生效。业务含义：宁可漏掉一个把握不大的猜测，也不要动到正文用词。
+#
+# 与「检测灵敏度」的分工：
+#   · 置信度下限 = 绝对底线，回答「这条识别本身可不可信」；
+#   · 检测灵敏度 = 底线之上的取舍，回答「这类实体要不要那么激进」。
+MIN_CONFIDENCE_DEFAULT = 0.80
+
+#: 当前生效的置信度下限（由 UI / 配置在每次处理前设置）
+_MIN_CONFIDENCE: float = MIN_CONFIDENCE_DEFAULT
+
+
+def set_min_confidence(value: float | None) -> None:
+    """设置全局置信度下限；非法值回退默认 0.8。"""
+    global _MIN_CONFIDENCE
+    try:
+        v = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        v = MIN_CONFIDENCE_DEFAULT
+    _MIN_CONFIDENCE = min(max(v, 0.0), 1.0)
+
+
+def get_min_confidence() -> float:
+    return _MIN_CONFIDENCE
+
+
+# --------------------------------------------------------------------------
+# 程序根目录 & whitelist.txt（用户可直接编辑的「绝不脱敏」词表）
+# --------------------------------------------------------------------------
+
+
+def app_root() -> Path:
+    """返回「程序根目录」——用户能直接看到并编辑配置文件的那个目录。
+
+    - 冻结模式：exe 所在目录（用户双击的那个文件旁边）；
+    - 开发模式：项目根目录（``app/`` 的上一级）。
+    """
+    if IS_FROZEN:
+        try:
+            return Path(sys.executable).resolve().parent
+        except OSError:
+            return Path.cwd()
+    return Path(__file__).resolve().parent.parent
+
+
+WHITELIST_FILENAME = "whitelist.txt"
+
+#: 首次运行时自动生成的模板内容
+_WHITELIST_TEMPLATE = """\
+# ==========================================================================
+# 白名单 —— 写在这里的词「绝不脱敏」
+# ==========================================================================
+# 用法：
+#   · 一行一个词；也可用中文逗号「，」或英文逗号「,」在一行里写多个
+#   · 以 # 开头的行是注释，会被忽略
+#   · 保存后无需重启程序，下一次点「开始脱敏」即自动重新读取
+#
+# 匹配规则（重要）：
+#   按「整条识别结果」精确匹配，不做包含匹配。
+#   例：白名单写了「工程」，则单独被识别出的「工程」不会脱敏，
+#       而「上海市建设工程监理咨询有限公司」仍会正常脱敏（它是一个完整机构名）。
+#   程序会自动忽略「本 / 该 / 此 / 各 / 上述」等前缀和结尾的「的」，
+#   因此写「工程」即可同时保护「本工程」「该工程」。
+# --------------------------------------------------------------------------
+
+# ---- 合同 / 商务通用术语 ----
+二次开发
+许可
+许可证
+授权
+卖方
+买方
+买卖双方
+甲方
+乙方
+丙方
+供方
+需方
+承包方
+发包方
+中标人
+投标人
+招标人
+
+# ---- 工程 / 技术通用术语 ----
+工程
+项目
+标段
+系统
+平台
+网络
+设备
+软件
+硬件
+接口
+验收
+调试
+运维
+质保
+技术文档
+技术规范
+施工
+安装
+集成
+
+# ---- 常见非敏感套话（易被 NER 误判为人名 / 地名 / 机构）----
+根据
+按照
+本项目
+本工程
+本合同
+通用条款
+专用条款
+网络安全
+信息安全
+严格遵守
+中华民族
+伟大复兴
+新建
+改造
+扩容
+"""
+
+
+def whitelist_path() -> Path:
+    """whitelist.txt 的完整路径（程序根目录下）。"""
+    return app_root() / WHITELIST_FILENAME
+
+
+def ensure_whitelist_file() -> Path:
+    """确保 whitelist.txt 存在；不存在则写入模板。返回其路径。
+
+    任何写入失败都静默忽略（例如程序装在只读目录），此时白名单为空，
+    不影响主流程。
+    """
+    p = whitelist_path()
+    try:
+        if not p.is_file():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(_WHITELIST_TEMPLATE, encoding="utf-8")
+    except OSError:
+        pass
+    return p
+
+
+#: (mtime, size, 词集) —— 按文件指纹缓存，用户改完文件立即生效
+_WL_CACHE: tuple[float, int, frozenset[str]] | None = None
+
+
+def _parse_whitelist_text(text: str) -> set[str]:
+    """解析白名单文本：# 注释、空行忽略，支持逗号分隔多词。"""
+    words: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # 行内注释：「工程   # 通用术语」
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for part in re.split(r"[,，、;；\t]+", line):
+            w = part.strip()
+            if w:
+                words.add(w)
+    return words
+
+
+def load_whitelist(force: bool = False) -> frozenset[str]:
+    """读取 whitelist.txt（带文件指纹缓存）。
+
+    文件缺失时自动生成模板；读取失败返回空集合，绝不影响主流程。
+    """
+    global _WL_CACHE
+    p = ensure_whitelist_file()
+    try:
+        st = p.stat()
+        fp = (st.st_mtime, st.st_size)
+    except OSError:
+        return frozenset()
+
+    if not force and _WL_CACHE is not None:
+        if (_WL_CACHE[0], _WL_CACHE[1]) == fp:
+            return _WL_CACHE[2]
+
+    try:
+        words = _parse_whitelist_text(p.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        try:
+            words = _parse_whitelist_text(p.read_text(encoding="gbk"))
+        except (OSError, UnicodeDecodeError, LookupError):
+            words = set()
+
+    wl = frozenset(words)
+    _WL_CACHE = (fp[0], fp[1], wl)
+    return wl
+
+
+#: 归一化时剥离的限定前缀（汉语指示词闭集，非实体清单）
+_WL_DET_PREFIX = ("本项", "该项", "上述", "本次", "本", "该", "此", "各", "其")
+
+
+def _wl_normalize(text: str) -> set[str]:
+    """生成一条识别结果的等价写法集合，用于与白名单比对。
+
+    「本工程」「该工程」「工程的」都能匹配到白名单里的「工程」。
+    """
+    s = (text or "").strip()
+    if not s:
+        return set()
+    forms = {s, s.lower()}
+    # 去掉结尾的「的」
+    core = s[:-1] if len(s) > 1 and s.endswith("的") else s
+    forms.add(core)
+    # 去掉指示性前缀
+    for pre in _WL_DET_PREFIX:
+        if core.startswith(pre) and len(core) > len(pre) + 1:
+            forms.add(core[len(pre):])
+            break
+    return {f for f in forms if f}
+
+
+def is_whitelisted(text: str, whitelist: frozenset[str] | set[str] | None = None) -> bool:
+    """判断一条识别结果是否命中白名单（整条精确匹配 + 限定词归一化）。"""
+    wl = load_whitelist() if whitelist is None else whitelist
+    if not wl:
+        return False
+    return bool(_wl_normalize(text) & set(wl))
+
+
+# --------------------------------------------------------------------------
 # 自主识别层（构词法 + 上下文驱动，不依赖实体词库 / 映射表）
 # --------------------------------------------------------------------------
 # 设计原则：不去「记住」哪些公司、项目、人名是敏感的——那需要无穷无尽的词库，
@@ -315,7 +547,7 @@ _ABSTRACT_TAIL: tuple[str, ...] = (
     "能力", "要求", "标准", "规范", "原则", "措施", "手段", "内容", "功能",
     "性能", "指标", "范围", "条件", "环境", "基础", "核心", "特点", "优势",
     "问题", "情况", "结果", "目标", "任务", "职责", "义务", "权利", "责任",
-    "性", "度", "化", "族", "观", "史", "学", "论", "说", "率", "量",
+    "性", "度", "化", "族", "观", "史", "论", "说", "率", "量",
     "力", "感", "式", "型", "法", "制", "义", "派", "风", "情",
 )
 
@@ -863,8 +1095,25 @@ def _patch_detector_rules() -> None:
             alts = "|".join(f"(?<={t}[:：])" for t in tails)
             return re.compile(f"(?:{alts})[ \t　]*{val_re}", re.UNICODE)
 
+        # —— 置信度校准 ——
+        # 上游给「确定性模式」的分数偏低（邮箱 0.75 / 日期 0.70），在
+        # 0.8 的全局下限下会被连带误滤。这里按规则的**真实精度**重新标定：
+        # 正则匹配到的邮箱、手机号、身份证几乎不可能是别的东西。
+        # 反之，银行卡规则 \d{16,19} 会命中任意长数字串（订单号、编号），
+        # 精度确实低，保持 0.65 —— 在 0.8 下限下自动退化为「仅提示」，
+        # 这正是本次改造想要的效果。
+        _recal: dict[str, float] = {
+            r"[\w.-]+@[\w.-]+\.\w+": 0.95,        # 邮箱
+            r"1[3-9]\d{9}": 0.95,                 # 手机号
+            r"\d{17}[\dXx]": 0.92,                # 身份证号
+            r"\d{4}年\d{1,2}月\d{1,2}日": 0.85,   # 中文日期
+        }
+
         def _build(self):  # noqa: ANN001
-            rules = _orig(self)
+            rules = [
+                (rx, dt, _recal.get(getattr(rx, "pattern", ""), cf))
+                for rx, dt, cf in _orig(self)
+            ]
             extra = [
                 # 金额：阿拉伯数字（含「元」但不带万 / 亿，如 1,200,000元）
                 (re.compile(r"[\d,]+\.?\d*元"), DetectionType.AMOUNT, 0.80),
@@ -882,7 +1131,9 @@ def _patch_detector_rules() -> None:
                 (_addr_re, DetectionType.LOCATION, 0.88),
                 # 项目 / 工程名
                 (_project_re, DetectionType.PROJECT, 0.85),
-                (_title_re, DetectionType.PROJECT, 0.75),
+                # 标题行项目名：由「独立成行 + 无章节号 + 非虚词开头」三重
+                # 结构锚定，精度接近强中心词规则，标定 0.82（高于 0.8 下限）
+                (_title_re, DetectionType.PROJECT, 0.82),
             ]
 
             # —— 结构化字段：泛化「标签 → 值」模式（不枚举具体标签）——
@@ -911,12 +1162,24 @@ def _patch_detector_rules() -> None:
 
 
 def _patch_detector_dedup() -> None:
-    """检测结果子串去重（幂等）。
+    """检测结果子串去重（幂等，置信度感知）。
 
     自主识别的多条规则常对同一实体给出长短不一的片段
     （「中铁建电气化局」「工程有限公司」「中铁建电气化局集团第三工程
-    有限公司」）。这里只保留最长的那条，避免映射表被碎片刷屏。
-    用户词库命中的条目不参与裁剪。
+    有限公司」）。这里只保留最可信的那条，避免映射表被碎片刷屏。
+
+    **置信度感知**（关键修复）：长短片段重叠时，保留**置信度更高**的
+    一方；置信度相等才保留更长（完整名称优先）。
+
+    为什么必须如此？以 spaCy 后端为例：它可能把
+    「西南交通大学轨道交通运载系统全国重点实验室」整体识别为一个低置信
+    实体，而结构化规则同时精确命中其中的「西南交通大学」（0.92）。若仍
+    按「仅保留最长」的旧逻辑，低置信长片段会先把精确的短片段吞掉，随后
+    长片段又因低于置信度下限被策略层丢弃 —— 最终「西南交通大学」凭空
+    消失。改为「高置信优先」后，精确短片段得以保留。
+
+    用户词库（``source == "dictionary"``）命中条目永远保留、且永远胜出，
+    不受长短与置信度影响。
     """
     try:
         from mask_tool.core.detector import Detector
@@ -926,20 +1189,43 @@ def _patch_detector_dedup() -> None:
 
         _orig_detect = Detector.detect  # type: ignore[assignment]
 
+        def _conf_of(r):
+            try:
+                c = getattr(r, "confidence", None)
+                return float(c) if c is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
         def detect(self, text, file_path=""):  # noqa: ANN001
             results = _orig_detect(self, text, file_path)
+            if not results:
+                return results
+
+            # 先做「策略层预筛」：剔除注定会被置信度下限 / 白名单丢弃的
+            # 低质量候选，再对幸存者做子串去重。否则低质长片段会先把精确
+            # 短片段吞掉，随后自己又被下限丢弃，导致精确短片段凭空消失。
+            # 典型场景：spaCy 把「西南交通大学轨道交通运载系统全国重点
+            # 实验室」整体识别为低置信实体，吞掉其中精确的「西南交通大学」。
+            survivors = [
+                r for r in results
+                if getattr(r, "source", "") == "dictionary"
+                or (_conf_of(r) >= _MIN_CONFIDENCE
+                     and not is_whitelisted(r.text))
+            ]
+
             kept_texts: list[str] = []
             drop: set[str] = set()
-            for t in sorted({r.text for r in results}, key=len, reverse=True):
+            for t in sorted({r.text for r in survivors}, key=len, reverse=True):
                 if any(t in o for o in kept_texts):
                     drop.add(t)
                 else:
                     kept_texts.append(t)
             if not drop:
-                return results
-            return [r for r in results
-                    if r.text not in drop
-                    or getattr(r, "source", "") == "dictionary"]
+                return survivors
+            out = [r for r in survivors
+                   if r.text not in drop
+                   or getattr(r, "source", "") == "dictionary"]
+            return out
 
         Detector.detect = detect  # type: ignore[assignment]
         Detector._patched_dedup_by_engine = True  # type: ignore[attr-defined]
@@ -947,10 +1233,96 @@ def _patch_detector_dedup() -> None:
         pass
 
 
+#: NER 后端配置（由 UI / 配置在每次处理前设置）
+_NER_BACKEND: str = "auto"
+_NER_MODEL: str = ""
+
+
+def set_ner_backend(backend: str | None, model: str | None = "") -> None:
+    """设置 NER 后端。
+
+    Args:
+        backend: ``auto`` / ``spacy`` / ``jieba``
+        model:   spaCy 模型路径或包名；留空则自动发现
+    """
+    global _NER_BACKEND, _NER_MODEL
+    b = (backend or "auto").strip().lower()
+    _NER_BACKEND = b if b in ("auto", "spacy", "jieba") else "auto"
+    _NER_MODEL = (model or "").strip()
+
+
+def _load_ner_backend_module():
+    """导入可插拔后端模块（兼容包内 / 脚本两种引用方式）。"""
+    try:
+        from app import ner_backend as _nb
+        return _nb
+    except Exception:
+        try:
+            import ner_backend as _nb  # type: ignore[no-redef]
+            return _nb
+        except Exception:
+            return None
+
+
+def ner_status() -> dict:
+    """返回当前 NER 后端状态（供 UI 与 --selftest 展示）。"""
+    nb = _load_ner_backend_module()
+    if nb is None:
+        return {"configured": _NER_BACKEND, "active": "jieba",
+                "spacy_installed": False, "model": "",
+                "reason": "未找到 ner_backend 模块，使用 jieba"}
+    try:
+        return nb.backend_status(_NER_BACKEND, _NER_MODEL or None, app_root())
+    except Exception as exc:
+        return {"configured": _NER_BACKEND, "active": "jieba",
+                "spacy_installed": False, "model": "",
+                "reason": f"后端探测失败：{exc}"}
+
+
+def _patch_ner_backend() -> None:
+    """把 mask-tool 写死的 jieba NER 换成可插拔后端（幂等）。
+
+    上游 ``Pipeline.__init__`` 里是
+    ``from mask_tool.core.ner.jieba_ner import JiebaNER; ner_engine = JiebaNER()``，
+    属于**调用时导入**，因此替换模块属性即可生效，无需改动上游源码。
+
+    任何一步失败都退回原生 jieba —— 换引擎是增强项，不能成为故障点。
+    """
+    try:
+        from mask_tool.core.ner import jieba_ner as _jn
+
+        if getattr(_jn, "_patched_backend_by_engine", False):
+            return
+
+        _OrigJieba = _jn.JiebaNER
+
+        def _factory(*args, **kwargs):
+            nb = _load_ner_backend_module()
+            if nb is not None:
+                try:
+                    eng = nb.create_ner_engine(
+                        _NER_BACKEND, _NER_MODEL or None, app_root()
+                    )
+                    if eng is not None:
+                        return eng
+                except Exception:
+                    pass
+            return _OrigJieba(*args, **kwargs)
+
+        _jn.JiebaNER = _factory  # type: ignore[assignment]
+        _jn._patched_backend_by_engine = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def _patch_policy() -> None:
     """对 mask-tool 的 PolicyEngine 打补丁（幂等）。
 
-    仅对 smart / aggressive 模式生效：
+    对**所有模式**生效的两道硬闸门（顺序即优先级）：
+      ① 白名单：``whitelist.txt`` 里的词绝不替换，无视来源与置信度；
+      ② 置信度下限：``confidence < MIN_CONFIDENCE``（默认 0.8）只提示不替换。
+
+    其后仅对 smart / aggressive 模式生效：
       · 词库与正则（含本项目补充的高置信正则）始终脱敏；
       · NER 项按「实体类型 × 用户灵敏度」阈值裁剪，机构名/人名更宽松、
         地名更严格，从而在尽量少误伤的前提下覆盖真实的客户名/项目名/金额。
@@ -965,6 +1337,16 @@ def _patch_policy() -> None:
         _orig_decide = PolicyEngine._decide  # type: ignore[assignment]
 
         def _decide(self, result):  # noqa: ANN001
+            # ① 白名单优先级最高：用户明确声明「绝不脱敏」的业务术语
+            #    （二次开发 / 许可 / 卖方 / 买方 / 工程 …），
+            #    无论来自词库、正则还是 NER，一律保留原文。
+            if is_whitelisted(result.text):
+                return DetectionStatus.HINT_ONLY
+
+            # ② 全局置信度下限：把握不大的识别只在报告里提示，不动正文
+            if float(getattr(result, "confidence", 0.0) or 0.0) < _MIN_CONFIDENCE:
+                return DetectionStatus.HINT_ONLY
+
             mode = self.config.mode
             if mode in ("smart", "aggressive"):
                 conf = result.confidence
@@ -993,7 +1375,8 @@ def _patch_policy() -> None:
                     t = thr["location"]
                 else:
                     t = thr["custom"]
-                return DetectionStatus.AUTO_MASK if conf >= t else DetectionStatus.HINT_ONLY
+                verdict = DetectionStatus.AUTO_MASK if conf >= t else DetectionStatus.HINT_ONLY
+                return verdict
             # strict / focused 等模式沿用上游原始逻辑
             return _orig_decide(self, result)
 
@@ -1368,6 +1751,10 @@ class MaskEngine:
         self._inproc = self._init_inproc()
         # 用户词库：合并基准词库后写出临时 YAML，返回路径；空则 None
         self._user_lexicon_file = self._build_user_lexicon(user_lexicon or {})
+        # 白名单：内置 whitelist.yaml + 用户 whitelist.txt 合并后的临时 YAML。
+        # 懒构建 + 实例级缓存，避免批量处理时每个文件都建一个临时目录。
+        self._whitelist_file: str | None = None
+        self._whitelist_built = False
 
     # -- 取消控制 ---------------------------------------------------------
 
@@ -1384,6 +1771,20 @@ class MaskEngine:
     def reset(self) -> None:
         self._cancelled = False
 
+    # -- 白名单 -----------------------------------------------------------
+
+    def refresh_whitelist(self) -> str | None:
+        """重新读取 whitelist.txt 并重建合并白名单，下一次处理即生效。"""
+        self._whitelist_file = self._build_merged_whitelist()
+        self._whitelist_built = True
+        return self._whitelist_file
+
+    def _get_whitelist_file(self) -> str | None:
+        """取合并后的白名单文件路径（首次调用时构建）。"""
+        if not self._whitelist_built:
+            self.refresh_whitelist()
+        return self._whitelist_file
+
     # -- 进程内后端探测 ---------------------------------------------------
 
     @staticmethod
@@ -1398,7 +1799,9 @@ class MaskEngine:
             # 补充高置信正则（中文金额 / 项目工程名 / 纯数字金额）
             _patch_detector_rules()
             _patch_detector_dedup()
-            # 注入「检测灵敏度」可控的 smart/aggressive 策略
+            # 可插拔 NER 后端（spaCy / jieba），未配置时行为不变
+            _patch_ner_backend()
+            # 注入「白名单 + 置信度下限 + 检测灵敏度」策略
             _patch_policy()
             return (Pipeline, MaskConfig, DetectionStatus)
         except Exception:
@@ -1457,6 +1860,55 @@ class MaskEngine:
         except Exception:
             return None
 
+    @staticmethod
+    def _build_merged_whitelist() -> str | None:
+        """把内置 whitelist.yaml 与用户的 whitelist.txt 合并，写出临时 YAML。
+
+        为什么要合并到 mask-tool 自己的白名单里，而不是只在策略层拦截？
+        因为 mask-tool 在**更早的检测阶段**就会用它过滤
+        （``Detector`` 的正则/词库匹配、``JiebaNER.recognize``），
+        白名单词根本不会进入候选列表 —— 既更省事也更彻底。
+        策略层的 :func:`is_whitelisted` 是第二道保险，负责兜住那些
+        经过左边界修剪、去重后才成形的片段。
+        """
+        words: set[str] = set()
+
+        cfg_dir = _bundled_config_dir()
+        if cfg_dir is not None:
+            wlt = cfg_dir / "whitelist.yaml"
+            if wlt.is_file():
+                try:
+                    import yaml
+                    loaded = yaml.safe_load(wlt.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        base = loaded.get("whitelist")
+                        if isinstance(base, list):
+                            words |= {w for w in base if isinstance(w, str) and w.strip()}
+                    elif isinstance(loaded, list):
+                        words |= {w for w in loaded if isinstance(w, str) and w.strip()}
+                except Exception:
+                    pass
+
+        # 用户可编辑的 whitelist.txt（程序根目录）
+        words |= set(load_whitelist(force=True))
+
+        if not words:
+            return None
+
+        tmp_dir = tempfile.mkdtemp(prefix="masktool_wl_")
+        out = Path(tmp_dir) / "whitelist.yaml"
+        try:
+            import yaml
+            out.write_text(
+                yaml.dump({"whitelist": sorted(words)},
+                          allow_unicode=True, default_flow_style=False),
+                encoding="utf-8",
+            )
+            atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)
+            return str(out)
+        except Exception:
+            return None
+
     # -- 核心 -------------------------------------------------------------
 
     def process_one(
@@ -1467,6 +1919,9 @@ class MaskEngine:
         save_mapping: bool = True,
         suffix_tag: str = "_脱敏",
         sensitivity: str = SENSITIVITY_DEFAULT,
+        min_confidence: float | None = None,
+        ner_backend: str | None = None,
+        spacy_model: str | None = None,
     ) -> FileResult:
         """处理单个文件。任何异常都被转换为 FileResult，不向上抛。"""
         ext = src.suffix.lower()
@@ -1481,7 +1936,8 @@ class MaskEngine:
         # 优先使用进程内调用（冻结打包后唯一可靠路径）
         if self._inproc is not None:
             return self._process_one_inproc(
-                src, out_dir, mode, save_mapping, suffix_tag, sensitivity
+                src, out_dir, mode, save_mapping, suffix_tag,
+                sensitivity, min_confidence, ner_backend, spacy_model,
             )
 
         report_only = ext in REPORT_ONLY_EXTS
@@ -1569,6 +2025,9 @@ class MaskEngine:
         save_mapping: bool,
         suffix_tag: str,
         sensitivity: str = SENSITIVITY_DEFAULT,
+        min_confidence: float | None = None,
+        ner_backend: str | None = None,
+        spacy_model: str | None = None,
     ) -> FileResult:
         """进程内调用 mask-tool 的 Pipeline（冻结打包后的主路径）。"""
         ext = src.suffix.lower()
@@ -1576,6 +2035,14 @@ class MaskEngine:
 
         # 应用用户选择的 smart/aggressive 检测灵敏度（仅对 NER 生效）
         set_smart_sensitivity(sensitivity)
+        # 应用全局置信度下限（对所有来源生效；None 表示沿用当前值）
+        if min_confidence is not None:
+            set_min_confidence(min_confidence)
+        # 应用 NER 后端选择（auto/spacy/jieba；None 表示沿用当前值）。
+        # _patch_ner_backend 注入的工厂在每次实例化时读取这两个全局量，
+        # 因此此处设置会在本文件处理时立即生效。
+        if ner_backend is not None:
+            set_ner_backend(ner_backend, spacy_model)
 
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -1597,8 +2064,12 @@ class MaskEngine:
         if cfg is None:
             cfg = MaskConfig(mode=mode)
 
-        # 把白名单指向上面打包进 exe 的资源，保证冻结后也能加载
-        if cfg_dir is not None:
+        # 白名单：内置 whitelist.yaml + 用户 whitelist.txt 合并后的临时文件。
+        # 合并失败（极端情况）时回退到打包资源，保证冻结后也能加载。
+        merged_wl = self._get_whitelist_file()
+        if merged_wl:
+            cfg.whitelist_path = merged_wl
+        elif cfg_dir is not None:
             wlt = cfg_dir / "whitelist.yaml"
             if wlt.is_file():
                 cfg.whitelist_path = str(wlt)
@@ -1679,13 +2150,30 @@ class MaskEngine:
         save_mapping: bool = True,
         suffix_tag: str = "_脱敏",
         sensitivity: str = SENSITIVITY_DEFAULT,
+        min_confidence: float | None = None,
+        ner_backend: str | None = None,
+        spacy_model: str | None = None,
         on_progress: Callable[[int, int, Path], None] | None = None,
         on_result: Callable[[FileResult], None] | None = None,
     ) -> BatchOutcome:
-        """批量处理。``out_dir_for`` 用于为每个源文件决定输出目录。"""
+        """批量处理。``out_dir_for`` 用于为每个源文件决定输出目录。
+
+        白名单与置信度下限在**整批开始前统一装载一次**，因此批量处理中的
+        每个文件都适用同一套规则，不会出现「第一个文件生效、后面失效」。
+        """
         self.reset()
         items = list(files)
         outcome = BatchOutcome()
+
+        # —— 整批统一装载规则 ——
+        # 重新读取 whitelist.txt（用户可能刚改完就点了开始），并把
+        # 合并后的白名单重新注入引擎；置信度下限与 NER 后端同理。
+        if min_confidence is not None:
+            set_min_confidence(min_confidence)
+        if ner_backend is not None:
+            set_ner_backend(ner_backend, spacy_model)
+        load_whitelist(force=True)
+        self.refresh_whitelist()
 
         for idx, src in enumerate(items, start=1):
             if self._cancelled:
@@ -1697,7 +2185,8 @@ class MaskEngine:
             res = self.process_one(
                 src, out_dir_for(src), mode=mode,
                 save_mapping=save_mapping, suffix_tag=suffix_tag,
-                sensitivity=sensitivity,
+                sensitivity=sensitivity, min_confidence=min_confidence,
+                ner_backend=ner_backend, spacy_model=spacy_model,
             )
             outcome.results.append(res)
             if on_result:

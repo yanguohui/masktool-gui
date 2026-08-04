@@ -19,6 +19,27 @@ DEFAULTS: dict[str, Any] = {
     "mask_tool_path": "",         # 手动指定的 mask-tool 可执行文件
     "last_dir": "",
     "user_lexicon": {},           # 用户自定义敏感词词库：{类别: [词...]}
+    # —— 识别质量控制 ——
+    # 全局置信度下限：低于此值的识别结果只在报告里提示，不替换正文。
+    # 这是凌驾于「检测灵敏度」之上的硬闸门，对词库/正则/NER 全部生效。
+    "min_confidence": 0.8,
+    # NER 后端：auto（有 spaCy 模型就用，否则 jieba）/ spacy / jieba
+    "ner_backend": "auto",
+    # spaCy 模型路径或包名；留空则自动发现（优先 程序根目录/models/）
+    "spacy_model": "",
+}
+
+#: 数值型配置的合法区间，读取时做钳位
+_NUMERIC_RANGE: dict[str, tuple[float, float]] = {
+    "min_confidence": (0.0, 1.0),
+}
+
+#: 枚举型配置的合法取值，非法时回退默认
+_ENUM_VALUES: dict[str, tuple[str, ...]] = {
+    "mode": ("strict", "smart", "aggressive"),
+    "sensitivity": ("high", "medium", "low", "minimal"),
+    "output_mode": ("source", "custom"),
+    "ner_backend": ("auto", "spacy", "jieba"),
 }
 
 
@@ -43,10 +64,24 @@ def load() -> dict[str, Any]:
             loaded = json.loads(f.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 for k in DEFAULTS:
-                    if k in loaded and isinstance(loaded[k], type(DEFAULTS[k])):
-                        data[k] = loaded[k]
+                    if k not in loaded:
+                        continue
+                    val = loaded[k]
+                    if k in _NUMERIC_RANGE:
+                        # 数值项：接受 int/float，超界钳位，非数值忽略
+                        if isinstance(val, bool) or not isinstance(val, (int, float)):
+                            continue
+                        lo, hi = _NUMERIC_RANGE[k]
+                        data[k] = min(max(float(val), lo), hi)
+                    elif isinstance(val, type(DEFAULTS[k])):
+                        data[k] = val
     except (OSError, ValueError, TypeError):
         pass
+
+    # 枚举项：非法取值一律回退默认，避免下游拿到无效模式
+    for key, allowed in _ENUM_VALUES.items():
+        if data.get(key) not in allowed:
+            data[key] = DEFAULTS[key]
 
     # 用户词库：清洗为 {str: [str,...]}，剔除空值与非法值
     raw_lex = data.get("user_lexicon")
