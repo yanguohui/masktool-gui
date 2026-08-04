@@ -233,7 +233,7 @@ _SMART_THR: dict[str, float] = dict(SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT]["thr
 
 
 # --------------------------------------------------------------------------
-# 全局置信度下限：低于此值的识别结果一律「只提示、不替换」
+# 置信度下限：按实体类型分别设置（低于各自下限的一律「只提示、不替换」）
 # --------------------------------------------------------------------------
 # 这是一道**凌驾于灵敏度档位之上**的硬闸门，对 dictionary / regex / ner
 # 全部来源生效。业务含义：宁可漏掉一个把握不大的猜测，也不要动到正文用词。
@@ -241,14 +241,42 @@ _SMART_THR: dict[str, float] = dict(SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT]["thr
 # 与「检测灵敏度」的分工：
 #   · 置信度下限 = 绝对底线，回答「这条识别本身可不可信」；
 #   · 检测灵敏度 = 底线之上的取舍，回答「这类实体要不要那么激进」。
-MIN_CONFIDENCE_DEFAULT = 0.80
+#
+# 按实体类型分别设下限：机构名（company）/ 项目名（project）构词稳定、可靠，
+# 可放低门槛以提召回；地名（location）误报极多、须更严；人名（person）置信度
+# 分布分散且上限低，给最低门槛保召回（误报由构词法复核闸门二次拦截）。
+MIN_CONFIDENCE_BY_TYPE: dict[str, float] = {
+    "company": 0.75,
+    "person": 0.60,
+    "location": 0.80,
+    "project": 0.75,
+}
+#: 未列入上表的类型（government / subject / custom / amount …）兜底下限
+MIN_CONFIDENCE_DEFAULT_FLOOR = 0.80
 
-#: 当前生效的置信度下限（由 UI / 配置在每次处理前设置）
+#: 全局「兜底下限」（由 UI 设置）。0 表示不额外抬高，完全按各类型下限；
+#: 若被设为 >0，则作为所有类型下限的统一抬高值（取 max）。
+MIN_CONFIDENCE_DEFAULT = 0.0
+
+#: 当前生效的全局兜底下限（由 UI / 配置在每次处理前设置）
 _MIN_CONFIDENCE: float = MIN_CONFIDENCE_DEFAULT
 
 
+def _min_conf_for_type(name: str) -> float:
+    """返回某实体类型的置信度下限。
+
+    ``name`` 为 DetectionType 的小写字符串（company/person/location/
+    project/government/subject/custom/amount…）。全局兜底下限 ``_MIN_CONFIDENCE``
+    若 >0，则作为统一抬高值参与 max。
+    """
+    base = MIN_CONFIDENCE_BY_TYPE.get(name, MIN_CONFIDENCE_DEFAULT_FLOOR)
+    if _MIN_CONFIDENCE > 0:
+        return max(base, _MIN_CONFIDENCE)
+    return base
+
+
 def set_min_confidence(value: float | None) -> None:
-    """设置全局置信度下限；非法值回退默认 0.8。"""
+    """设置全局「兜底下限」（0 表示按各类型下限，不额外抬高）。"""
     global _MIN_CONFIDENCE
     try:
         v = float(value)  # type: ignore[arg-type]
@@ -259,6 +287,14 @@ def set_min_confidence(value: float | None) -> None:
 
 def get_min_confidence() -> float:
     return _MIN_CONFIDENCE
+
+
+def _type_name_of(result) -> str:
+    """提取 DetectionResult 的实体类型名（小写），便于查表。"""
+    tt = getattr(result, "text_type", None)
+    if tt is None:
+        return ""
+    return str(getattr(tt, "value", tt)).lower()
 
 
 # --------------------------------------------------------------------------
@@ -604,9 +640,11 @@ _PROJECT_CORE_WEAK: tuple[str, ...] = (
 )
 
 #: 项目 / 工程名内部须出现的实体指示语素（区分真专名与「重要项目」这类泛指）
+#: 注：已移除过于泛用的「服务 / 软件 / 硬件」（几乎任何业务短语都含这些字眼，
+#: 保留只会放大误报），仅保留具备专名区分度的语素。
 _PROJECT_INDICATOR: tuple[str, ...] = (
-    "系统", "平台", "建设", "网络", "扩容", "改造", "升级", "服务", "软件",
-    "硬件", "中心", "体系", "能力", "研发", "基地", "方案", "应用", "采购",
+    "系统", "平台", "建设", "网络", "扩容", "改造", "升级",
+    "中心", "体系", "能力", "研发", "基地", "方案", "应用", "采购",
     "集成", "运维", "安防", "监控", "感知", "数据", "信息", "智能", "数字",
     "网", "院", "厂", "站", "所", "线", "库", "实验室", "子系统",
 )
@@ -757,9 +795,13 @@ def _looks_like_person_labeled(text: str) -> bool:
 
 
 def _looks_like_project(text: str) -> bool:
-    """按「修饰 + 项目类中心词」构词法判断是否为项目 / 工程名。"""
+    """按「修饰 + 项目类中心词」构词法判断是否为项目 / 工程名。
+
+    长度门槛 ≥6 字符：过短的片段（如「本工程」「该平台」）多为泛指或
+    句子成分，不具备专名区分度，直接排除以收紧误报。
+    """
     n = len(text)
-    if n < 4 or _starts_with_function_word(text):
+    if n < 6 or _starts_with_function_word(text):
         return False
     # 「重要项目」「该工程」这类泛指不含实体指示语素，据此与真项目名区分
     has_ind = any(ind in text for ind in _PROJECT_INDICATOR)
@@ -1163,6 +1205,13 @@ def _patch_detector_rules() -> None:
                 # 标题行项目名：由「独立成行 + 无章节号 + 非虚词开头」三重
                 # 结构锚定，精度接近强中心词规则，标定 0.82（高于 0.8 下限）
                 (_title_re, DetectionType.PROJECT, 0.82),
+                # 结构化编号：格式确定性高，直接标定高置信（均高于各类型下限）
+                # 项目编号：AB12-2024-001
+                (re.compile(r"[A-Z]{2,4}-\d{4}-\d{3,}"), DetectionType.PROJECT, 0.90),
+                # 合同编号：HT2024-0001 / HT_2024_0001
+                (re.compile(r"HT[-_]?\d{4}[-_]?\d{4,}"), DetectionType.CUSTOM, 0.90),
+                # 订单号：ORD1234567
+                (re.compile(r"ORD[-_]?\d{6,}"), DetectionType.CUSTOM, 0.85),
             ]
 
             # —— 结构化字段：泛化「标签 → 值」模式（不枚举具体标签）——
@@ -1238,7 +1287,7 @@ def _patch_detector_dedup() -> None:
             survivors = [
                 r for r in results
                 if getattr(r, "source", "") == "dictionary"
-                or (_conf_of(r) >= _MIN_CONFIDENCE
+                or (_conf_of(r) >= _min_conf_for_type(_type_name_of(r))
                      and not is_whitelisted(r.text))
             ]
 
@@ -1263,8 +1312,10 @@ def _patch_detector_dedup() -> None:
 
 
 #: NER 后端配置（由 UI / 配置在每次处理前设置）
-_NER_BACKEND: str = "auto"
-_NER_MODEL: str = ""
+#: 默认后端切换为 spaCy，默认模型优先 zh_core_web_md（未安装时回退到内置
+#: jieba，仍开箱即用；详见 discover_spacy_model 的兜底）。
+_NER_BACKEND: str = "spacy"
+_NER_MODEL: str = "zh_core_web_md"
 
 
 def set_ner_backend(backend: str | None, model: str | None = "") -> None:
@@ -1372,27 +1423,38 @@ def _patch_policy() -> None:
             if is_whitelisted(result.text):
                 return DetectionStatus.HINT_ONLY
 
-            # ② 全局置信度下限：把握不大的识别只在报告里提示，不动正文
-            if float(getattr(result, "confidence", 0.0) or 0.0) < _MIN_CONFIDENCE:
+            # ② 置信度下限（按实体类型）：把握不大的识别只在报告里提示，不动正文
+            _name = _type_name_of(result)
+            if float(getattr(result, "confidence", 0.0) or 0.0) < _min_conf_for_type(_name):
                 return DetectionStatus.HINT_ONLY
 
+            conf = result.confidence
+            src = getattr(result, "source", "") or ""
             mode = self.config.mode
+
+            # strict（严格）：仅「用户词库 / 基准词库」（dictionary 来源）参与脱敏；
+            # 正则与 NER 命中一律只提示、不替换，最大限度避免自动误伤。
+            if mode == "strict":
+                if src == "dictionary":
+                    return DetectionStatus.AUTO_MASK if conf >= 0.95 \
+                        else DetectionStatus.HINT_ONLY
+                return DetectionStatus.HINT_ONLY
+
             if mode in ("smart", "aggressive"):
-                conf = result.confidence
-                src = getattr(result, "source", "") or ""
                 if src == "dictionary":
                     # 用户词库 / 基准词库：永远脱敏
                     return DetectionStatus.AUTO_MASK if conf >= 0.95 \
                         else DetectionStatus.HINT_ONLY
                 if src == "regex":
-                    # 高置信正则（手机/身份证/邮箱/金额/IP/MAC/日期/中文金额/项目名）始终脱敏
+                    # 高置信正则（手机/身份证/邮箱/金额/IP/MAC/日期/中文金额/
+                    # 项目名/项目编号/合同编号/订单号）始终脱敏
                     if conf >= _REGEX_AUTO:
                         return DetectionStatus.AUTO_MASK
                     if conf >= _REGEX_SUGGEST:
                         return DetectionStatus.SUGGEST_MASK
                     return DetectionStatus.HINT_ONLY
                 # NER（及未知来源）：先强制过滤明显误报，再按灵敏度裁剪
-                name = getattr(result.text_type, "value", str(result.text_type)).lower()
+                name = _name or getattr(result.text_type, "value", str(result.text_type)).lower()
                 if _ner_should_suppress(result.text, name):
                     return DetectionStatus.HINT_ONLY
                 thr = _AGGRESSIVE_THR if mode == "aggressive" else _SMART_THR
@@ -1406,7 +1468,7 @@ def _patch_policy() -> None:
                     t = thr["custom"]
                 verdict = DetectionStatus.AUTO_MASK if conf >= t else DetectionStatus.HINT_ONLY
                 return verdict
-            # strict / focused 等模式沿用上游原始逻辑
+            # focused 等其它模式沿用上游原始逻辑
             return _orig_decide(self, result)
 
         PolicyEngine._decide = _decide  # type: ignore[assignment]

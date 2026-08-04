@@ -201,8 +201,8 @@ class MaskApp:
 
     def _build_window(self) -> None:
         self.root.title(f"{APP_TITLE}  v{APP_VERSION}")
-        self.root.geometry("740x660")
-        self.root.minsize(680, 600)
+        self.root.geometry("760x800")
+        self.root.minsize(700, 680)
 
         style = ttk.Style()
         for theme in ("vista", "winnative", "clam"):
@@ -231,7 +231,8 @@ class MaskApp:
         outer = ttk.Frame(self.root, padding=(12, 10, 12, 10))
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(1, weight=1)
+        # 文件列表区域必须保留最小高度，避免选项区过多时被压成 0
+        outer.rowconfigure(1, weight=1, minsize=140)
 
         # ---- 引擎状态条 ----
         bar = ttk.Frame(outer)
@@ -249,6 +250,9 @@ class MaskApp:
         self.btn_whitelist = ttk.Button(bar, text="白名单…", width=11,
                                         command=self.open_whitelist_editor)
         self.btn_whitelist.grid(row=0, column=3, padx=(6, 0))
+        self.btn_mark_miss = ttk.Button(bar, text="标记漏报…", width=11,
+                                        command=self.open_mark_missed)
+        self.btn_mark_miss.grid(row=0, column=4, padx=(6, 0))
 
         # ---- 文件列表 ----
         box = ttk.LabelFrame(outer, text=" 待处理文件 ", padding=(8, 6))
@@ -324,13 +328,14 @@ class MaskApp:
             self._sens_tooltips[key] = Tooltip(rb, lvl["desc"])
             self._sens_radios.append(rb)
 
-        # 当前档位释义（常驻显示，强化悬浮提示）
-        self.lbl_sens_desc = ttk.Label(
-            opt, text="", style="Hint.TLabel", wraplength=660, justify="left",
+        # 灵敏度详细说明已改为鼠标悬停在单选按钮上的 Tooltip，避免长文本挤占界面
+        self.lbl_sens_hint = ttk.Label(
+            opt, text="（鼠标悬停在灵敏度选项上查看详细说明）",
+            style="Hint.TLabel", wraplength=660, justify="left",
         )
-        self.lbl_sens_desc.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        self.lbl_sens_hint.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
         # 这三个控件仅在 smart 模式下显示，由 _sync_mode_dependent 控制
-        self._sens_widgets = [self.lbl_sens_title, sens_row, self.lbl_sens_desc]
+        self._sens_widgets = [self.lbl_sens_title, sens_row, self.lbl_sens_hint]
 
         self.var_mapping = BooleanVar(value=bool(self.cfg["save_mapping"]))
         ttk.Checkbutton(opt, text="导出映射表（用于还原）",
@@ -547,6 +552,113 @@ class MaskApp:
         ttk.Button(btn_frm, text="保存", width=10, style="Run.TButton",
                    command=do_save).grid(row=0, column=2, sticky="e")
 
+    # -- 标记漏报（右上角「标记漏报…」按钮）-------------------------------
+
+    def open_mark_missed(self) -> None:
+        """标记漏报：把遗漏未脱敏的文本片段，人工指定类型后加入用户词库。
+
+        用户可在上方文本框粘贴待处理原文并选中片段，点「用选中内容」填入；
+        也可直接在「片段」框输入。选择实体类型后「加入词库并保存」，该词下次
+        脱敏（尤其 strict / smart 模式）即会自动命中脱敏。
+        """
+        win = tk.Toplevel(self.root)
+        win.title("标记漏报 — 加入用户词库")
+        win.geometry("520x470")
+        win.minsize(420, 380)
+        win.transient(self.root)
+        win.grab_set()
+        fam, size = ui_font()
+
+        frm = ttk.Frame(win, padding=(12, 10, 12, 10))
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(0, weight=1)
+        frm.columnconfigure(1, weight=1)
+        frm.columnconfigure(2, weight=0)
+        frm.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            frm,
+            text="① 粘贴原文并选中漏报片段（或直接在下方的「片段」框输入）：",
+            style="Hint.TLabel",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        txt = tk.Text(frm, height=8, wrap="word", font=(fam, size))
+        txt.grid(row=1, column=0, columnspan=3, sticky="nsew")
+        txt.insert("1.0",
+                   "在此粘贴包含漏报实体的原文，用鼠标选中那段应被脱敏的文字…")
+
+        ttk.Label(frm, text="片段：").grid(row=2, column=0, sticky="w",
+                                          pady=(6, 2))
+        var_frag = StringVar()
+        ent_frag = ttk.Entry(frm, textvariable=var_frag)
+        ent_frag.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(6, 2))
+
+        def use_selection() -> None:
+            try:
+                sel = txt.get("sel.first", "sel.last").strip()
+            except Exception:
+                sel = ""
+            if sel:
+                var_frag.set(sel)
+
+        ttk.Button(frm, text="用选中内容", width=12,
+                   command=use_selection).grid(row=3, column=0, sticky="w",
+                                              pady=2)
+        ttk.Label(frm, text="实体类型：").grid(row=3, column=1, sticky="e",
+                                              pady=2)
+        var_cat = StringVar(value=LEX_CATEGORIES[0][0])
+        cmb_cat = ttk.Combobox(
+            frm, textvariable=var_cat, state="readonly",
+            values=[c[0] for c in LEX_CATEGORIES], width=14,
+        )
+        cmb_cat.grid(row=3, column=2, sticky="e", pady=2)
+
+        ttk.Label(
+            frm,
+            text="② 确认片段与类型后，点「加入词库并保存」，该词下次脱敏即生效。",
+            style="Hint.TLabel",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 2))
+
+        btn_frm = ttk.Frame(frm)
+        btn_frm.grid(row=5, column=0, columnspan=3, sticky="e", pady=(4, 0))
+
+        def do_add() -> None:
+            word = var_frag.get().strip()
+            if not word:
+                messagebox.showwarning("缺少片段",
+                                       "请先输入或选中要标记的文本片段。",
+                                       parent=win)
+                return
+            label_to_key = {lbl: k for lbl, k in LEX_CATEGORIES}
+            cat = label_to_key.get(var_cat.get(), "custom")
+            lex = self.cfg.setdefault("user_lexicon", {})
+            cur = list(lex.get(cat, []))
+            if word in cur:
+                messagebox.showinfo("已存在",
+                                    f"「{word}」已在「{var_cat.get()}」词库中，"
+                                    f"无需重复添加。", parent=win)
+                win.destroy()
+                return
+            cur.append(word)
+            lex[cat] = cur
+            settings.save(self.cfg)
+            try:
+                self._refresh_lex_list()
+            except Exception:
+                pass
+            messagebox.showinfo(
+                "已加入词库",
+                f"「{word}」已作为「{var_cat.get()}」加入用户词库并保存。\n"
+                f"下次脱敏（尤其是 strict / smart 模式）将自动命中脱敏。",
+                parent=win,
+            )
+            win.destroy()
+
+        ttk.Button(btn_frm, text="取消", width=10,
+                   command=win.destroy).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(btn_frm, text="加入词库并保存", width=16,
+                   style="Run.TButton", command=do_add).grid(row=0, column=1)
+
     # -- 文件管理 ---------------------------------------------------------
 
     def _initial_dir(self) -> str:
@@ -672,7 +784,6 @@ class MaskApp:
                 w.grid()
             key = self.var_sens.get()
             lvl = SENSITIVITY_LEVELS.get(key, SENSITIVITY_LEVELS[SENSITIVITY_DEFAULT])
-            self.lbl_sens_desc.configure(text=lvl["desc"])
         else:
             for w in self._sens_widgets:
                 w.grid_remove()
@@ -703,7 +814,7 @@ class MaskApp:
             row=0, column=0, sticky="w", pady=(2, 0))
         self.cmb_ner = ttk.Combobox(
             frame, textvariable=self.var_ner_backend, state="readonly",
-            values=list(self._NER_DISPLAY.values()), width=22,
+            values=list(self._NER_DISPLAY.values()), width=28,
         )
         self.cmb_ner.grid(row=0, column=1, sticky="w", padx=(0, 8),
                           pady=(2, 0))
@@ -725,27 +836,27 @@ class MaskApp:
                                     command=self.pick_spacy_model)
         self.btn_spacy.grid(row=0, column=1)
 
-        # 全局置信度下限
+        # 全局置信度下限（兜底下限：0 = 按实体类型自动判定）
         ttk.Label(frame, text="置信度下限：").grid(
             row=2, column=0, sticky="w", pady=(4, 0))
         self.var_min_conf = StringVar(
-            value=str(self.cfg.get("min_confidence", 0.8)))
+            value=str(self.cfg.get("min_confidence", 0.0)))
         sb = ttk.Spinbox(
             frame, from_=0.0, to=1.0, increment=0.05,
             textvariable=self.var_min_conf, width=8,
         )
         sb.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
         ttk.Label(frame,
-                  text="仅脱敏置信度 ≥ 此值的识别结果（0~1）",
+                  text="全局兜底下限（0=按类型自动：公司0.75/人名0.60/地点0.80/项目0.75）",
                   style="Hint.TLabel").grid(
             row=2, column=2, columnspan=2, sticky="w", pady=(4, 0))
 
-        # 引擎实时状态
+        # 引擎实时状态：标签只显示一行摘要，完整原因用 Tooltip 悬浮展示
         self.lbl_ner_status = ttk.Label(
-            frame, text="", style="Hint.TLabel", wraplength=680,
-            justify="left")
+            frame, text="", style="Hint.TLabel", justify="left")
         self.lbl_ner_status.grid(row=3, column=0, columnspan=4,
                                  sticky="w", pady=(4, 0))
+        self._ner_status_tooltip = Tooltip(self.lbl_ner_status, "")
         self._refresh_ner_status()
 
     def _on_ner_change(self) -> None:
@@ -757,11 +868,11 @@ class MaskApp:
             self.var_ner_backend.get(), "auto")
 
     def _min_conf_value(self) -> float:
-        """解析置信度下限输入框，非法或越界时回退默认 0.8。"""
+        """解析全局兜底下限输入框，非法或越界时回退默认 0.0（按类型自动）。"""
         try:
             v = float(self.var_min_conf.get().strip())
         except (ValueError, AttributeError):
-            return 0.8
+            return 0.0
         return min(max(v, 0.0), 1.0)
 
     def _refresh_ner_status(self) -> None:
@@ -769,18 +880,35 @@ class MaskApp:
             st = ner_status()
         except Exception:
             self.lbl_ner_status.configure(text="引擎状态：未知")
+            self._ner_status_tooltip.set_text("无法获取识别引擎状态")
             return
         active = st.get("active", "jieba")
         model = st.get("model") or "（自动发现）"
         if active == "spacy":
-            txt = f"当前识别引擎：spaCy（模型 {model}）"
-            self.lbl_ner_status.configure(text=txt)
+            short = f"当前识别引擎：spaCy（模型 {model}）"
+            detail = f"当前使用 spaCy 模型：{model}"
+            self.lbl_ner_status.configure(text=short)
+            self._ner_status_tooltip.set_text(detail)
+        elif st.get("model_missing", False):
+            # 模型未安装时的友好提示：给出安装命令，并说明已用 jieba 兜底
+            expected = self.var_spacy_model.get().strip() or "zh_core_web_md"
+            short = "当前识别引擎：jieba（内置）⚠️ 未安装 spaCy 模型，已自动回退"
+            detail = (
+                "当前识别引擎：jieba（内置）。\n"
+                "⚠️ 未安装 spaCy 模型，已自动回退；\n"
+                f"可运行  python -m spacy download {expected}  "
+                f"或把模型目录放到程序根目录的 models/ 下；"
+                f"当前已自动回退到内置 jieba。"
+            )
+            self.lbl_ner_status.configure(text=short)
+            self._ner_status_tooltip.set_text(detail)
         else:
             reason = st.get("reason") or ""
-            txt = f"当前识别引擎：jieba（内置）"
+            txt = "当前识别引擎：jieba（内置）"
             if reason:
                 txt += f"  · spaCy：{reason}"
             self.lbl_ner_status.configure(text=txt)
+            self._ner_status_tooltip.set_text(txt)
 
     def pick_spacy_model(self) -> None:
         p = filedialog.askdirectory(

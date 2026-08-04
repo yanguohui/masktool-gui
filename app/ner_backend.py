@@ -89,8 +89,8 @@ _REJECT_PENALTY = 0.35
 _DOMAIN_HINTS = ("telecom", "通信", "comm", "domain", "finetune", "ft")
 
 #: 兜底的通用中文模型（按效果从好到差）
-_GENERIC_MODELS = ("zh_core_web_trf", "zh_core_web_lg",
-                   "zh_core_web_md", "zh_core_web_sm")
+_GENERIC_MODELS = ("zh_core_web_md", "zh_core_web_lg",
+                   "zh_core_web_sm")
 
 ENV_MODEL = "MASKTOOL_SPACY_MODEL"
 
@@ -148,11 +148,27 @@ def _iter_model_dirs(root: Path) -> Iterable[Path]:
 
 def discover_spacy_model(explicit: str | None = None,
                          root: Path | None = None) -> str | None:
-    """按优先级找出要加载的 spaCy 模型（路径或包名）；找不到返回 None。"""
-    # ① 显式配置
-    for cand in (explicit, os.environ.get(ENV_MODEL)):
-        if cand and str(cand).strip():
-            return str(cand).strip()
+    """按优先级找出要加载的 spaCy 模型（路径或包名）；找不到返回 None。
+
+    显式指定的模型若当前环境并未安装（例如默认偏好 zh_core_web_md 但
+    尚未下载），**不会**硬返回这个不可用的名字，而是继续回退到已安装的
+    其它通用中文模型（如打包的 zh_core_web_md），从而尽可能用上 spaCy
+    而非静默退化为 jieba。
+    """
+    # ① 显式配置（环境变量优先于参数）
+    for cand in (os.environ.get(ENV_MODEL), explicit):
+        if not (cand and str(cand).strip()):
+            continue
+        name = str(cand).strip()
+        # 目录路径（领域微调模型常见形态）→ 直接返回，交由 spacy.load 加载
+        if Path(name).is_dir():
+            return name
+        # 包名：仅当确实可导入时才采用，否则回退到其它已安装模型
+        try:
+            importlib.import_module(name)
+            return name
+        except Exception:
+            pass
 
     # ② 程序根目录 models/ 下的模型目录（领域微调模型的约定位置）
     if root is not None:
@@ -384,7 +400,12 @@ def backend_status(backend: str = "auto",
     elif not has_spacy:
         active, reason = "jieba", "未安装 spaCy，已回退 jieba"
     elif not found:
-        active, reason = "jieba", "未找到 spaCy 模型，已回退 jieba"
+        expected = (model or "").strip() or "zh_core_web_md"
+        active, reason = "jieba", (
+            f"未找到 spaCy 模型（期望 {expected}），已回退 jieba。"
+            f"如需使用 spaCy 识别，请运行：python -m spacy download {expected}"
+            f" ，或把模型目录放到程序根目录的 models/ 下。"
+        )
     else:
         active, reason = "spacy", f"使用 spaCy 模型：{found}"
     return {
@@ -393,4 +414,6 @@ def backend_status(backend: str = "auto",
         "spacy_installed": has_spacy,
         "model": found or "",
         "reason": reason,
+        # 供 UI 判断是否弹出「模型未安装」友好提示
+        "model_missing": (b != "jieba" and not found),
     }

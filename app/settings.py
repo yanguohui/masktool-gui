@@ -20,13 +20,14 @@ DEFAULTS: dict[str, Any] = {
     "last_dir": "",
     "user_lexicon": {},           # 用户自定义敏感词词库：{类别: [词...]}
     # —— 识别质量控制 ——
-    # 全局置信度下限：低于此值的识别结果只在报告里提示，不替换正文。
-    # 这是凌驾于「检测灵敏度」之上的硬闸门，对词库/正则/NER 全部生效。
-    "min_confidence": 0.8,
+    # 全局「兜底下限」：0 表示按各实体类型下限（company 0.75 / person 0.60 /
+    # location 0.80 / project 0.75）自动判定；>0 时作为所有类型的统一抬高值。
+    "min_confidence": 0.0,
     # NER 后端：auto（有 spaCy 模型就用，否则 jieba）/ spacy / jieba
-    "ner_backend": "auto",
-    # spaCy 模型路径或包名；留空则自动发现（优先 程序根目录/models/）
-    "spacy_model": "",
+    "ner_backend": "spacy",
+    # spaCy 模型路径或包名；默认 zh_core_web_md（未安装时自动回退到内置
+    # jieba，仍开箱即用；也可在程序根目录 models/ 下放置领域微调模型）。
+    "spacy_model": "zh_core_web_md",
 }
 
 #: 数值型配置的合法区间，读取时做钳位
@@ -82,6 +83,11 @@ def load() -> dict[str, Any]:
     for key, allowed in _ENUM_VALUES.items():
         if data.get(key) not in allowed:
             data[key] = DEFAULTS[key]
+
+    # 迁移：旧版「全局置信度下限」默认 0.8，现改由按实体类型下限接管；
+    # 将遗留的 0.8 复位为 0.0（按类型自动），避免把各类型下限统一抬高。
+    if data.get("min_confidence") == 0.8:
+        data["min_confidence"] = 0.0
 
     # 用户词库：清洗为 {str: [str,...]}，剔除空值与非法值
     raw_lex = data.get("user_lexicon")
