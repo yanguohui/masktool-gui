@@ -9,10 +9,10 @@ packaging
 # 最终用户无需单独安装 mask-tool。
 mask-tool @ git+https://github.com/ZagooYWX/mask-tool.git@e39f04765e7f5ab705826f41d60003629f3cea8a
 
-# ===== 可选：spaCy NER 后端 =====
-# 仅当你在 GUI 的「识别引擎」里选 spaCy / 自动 并想用 spaCy 识别时才需要。
-# 打包后的单文件程序默认不含 spaCy（体积 / 许可考虑），会自动回退 jieba。
-# 源码 / 开发运行如需启用 spaCy：
+# ===== 内嵌：spaCy NER 后端 + 中文模型 =====
+# 已内嵌进打包后的单文件程序（见 masktool_gui.spec 的 collect_all），
+# 最终用户双击即用、无需另行安装。开发 / 源码运行同样需要：
 #   pip install spacy
-#   python -m spacy download zh_core_web_sm
+#   python -m spacy download zh_core_web_md
 spacy
+zh_core_web_md @ https://github.com/explosion/spacy-models/releases/download/zh_core_web_md-3.8.0/zh_core_web_md-3.8.0-py3-none-any.whl

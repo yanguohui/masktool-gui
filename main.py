@@ -49,11 +49,20 @@ def _selftest() -> None:
     out_dir = Path(sys.argv[3]) if len(sys.argv) > 3 else Path(tempfile.mkdtemp())
     try:
         import app.engine as E
+        from app.ner_backend import create_ner_engine, SpacyNER
         eng = E.MaskEngine(E.locate_mask_tool())
         r = eng.process_one(src, out_dir, mode="smart", save_mapping=True)
+        # 实际加载校验：确认 spaCy 模型在冻结环境下真的能被加载（不只是被发现）
+        _ner = create_ner_engine(E._NER_BACKEND, E._NER_MODEL or None, E.app_root())
+        _ner_loaded = _ner is not None and bool(_ner.is_available())
+        # 若加载失败，暴露底层错误以便诊断
+        _probe = SpacyNER(E._NER_MODEL or None, E.app_root())
         print(json.dumps({
             "frozen": E.IS_FROZEN,
             "tool": E.locate_mask_tool().display,
+            "ner": E.ner_status(),
+            "ner_loaded": _ner_loaded,
+            "ner_error": _probe.error,
             "ok": r.ok,
             "output": str(r.output) if r.output else None,
             "masked_count": r.masked_count,

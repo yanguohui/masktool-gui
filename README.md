@@ -26,7 +26,7 @@ PyInstaller 不能跨平台编译，Windows `.exe` 需要在 Windows 上另行�
 - **用户词库**：界面可直接添加公司名、人名、项目名等自定义敏感词；支持从 TXT 批量导入，并随设置自动保存。
 - **白名单（`whitelist.txt`）**：在程序根目录放置 `whitelist.txt`，逐行列出"绝不脱敏"的业务术语（如 `二次开发`、`许可`、`卖方`、`买方`、`工程`）。脱敏前会先读取并保护，无论来自词库、正则还是 NER，都原样保留。
 - **置信度下限**：界面「识别引擎」区可设置全局置信度下限（默认 0.8）。低于该值的识别结果只在报告里提示、不改动正文，进一步减少把"把握不大"的词误脱敏。
-- **可插拔 NER 后端**：界面「识别引擎」区可切换 `自动 / spaCy / jieba` 三档识别引擎，并指定 spaCy 模型路径。`自动` 在有 spaCy 时优先用 spaCy，否则回退 jieba。
+- **可插拔 NER 后端**：界面「识别引擎」区可切换 `自动 / spaCy / jieba` 三档识别引擎。**已内嵌 spaCy 中文模型 `zh_core_web_md`**，`自动`/`spaCy` 开箱即用，无需用户安装；亦支持指定通信工程等领域微调模型路径。
 - 输出目录默认与原文件相同，文件名自动追加 `_脱敏` 后缀。
 - 实时进度条、逐文件状态、处理完成后弹窗汇总。
 - 支持导出映射表，用于后续还原脱敏内容。
@@ -170,13 +170,15 @@ jieba NER 的置信度上限仅 0.85，且"人名/机构/地名"的可靠性差�
 
 | 选项 | 含义 |
 |------|------|
-| `自动（auto，默认）` | 环境里装了 spaCy 就用 spaCy，否则自动回退到 jieba。 |
-| `spaCy` | 强制使用 spaCy 命名实体识别（需已安装 `spacy` 与中文模型）。 |
+| `自动（auto，默认）` | 内置了 spaCy 中文模型就用 spaCy，否则自动回退到 jieba。 |
+| `spaCy` | 强制使用 spaCy 命名实体识别（程序已内嵌 `zh_core_web_md`）。 |
 | `jieba` | 强制使用 mask-tool 内置的 jieba NER。 |
 
-- **spaCy 模型路径**：留空时使用 `spaCy` 自动探测到的默认中文模型
-  （如 `zh_core_web_sm`）；若你有针对通信工程等领域**微调的模型**，点「浏览」
-  选中其目录（或填绝对路径）即可加载，例如 `models/telecom_ner`。
+- **已内嵌 spaCy 模型**：打包后的单文件程序**已经内置 `zh_core_web_md`**，
+  `自动` / `spaCy` 模式开箱即用，无需用户另行安装 spaCy 或下载模型。
+- **spaCy 模型路径**：留空时使用内嵌的 `zh_core_web_md`；若你有针对通信工程等领域
+  **微调的模型**，点「浏览」选中其目录（或填绝对路径）即可覆盖默认模型，
+  例如 `models/telecom_ner`。
 - 切换引擎 / 模型 / 置信度后，会**即时生效并应用于整批文件**，无需重启。
 
 > **领域微调模型怎么来？** 程序已支持自动发现 `models/` 下的领域模型，但模型文件需
@@ -270,17 +272,17 @@ cd mask-tool
 pip install -e .
 ```
 
-- **可选 spaCy 后端**：若想用 spaCy 命名实体识别（GUI 里把「识别引擎」切到 `spaCy`
-  或 `自动`），需额外安装：
+- **内嵌 spaCy 后端**：程序打包后的单文件**已内置 spaCy 与 `zh_core_web_md` 中文模型**，
+  `自动` / `spaCy` 模式开箱即用。若要在源码 / 开发环境运行 spaCy 后端：
 
 ```bash
 pip install spacy
-python -m spacy download zh_core_web_sm   # 默认中文模型
+python -m spacy download zh_core_web_md   # 内嵌的同款中文模型
 ```
 
-> 注意：打包后的单文件程序**默认不含 spaCy**（体积与许可考虑），此时「自动」模式会
-> 自动回退到内置的 jieba NER；要在冻结版里用 spaCy，需自行在打包环境安装并按需修改
-> `masktool_gui.spec` 的 `hiddenimports`。开发 / 源码运行则不受此限。
+> 打包时在 `masktool_gui.spec` 里通过 `collect_all("spacy")` 与
+> `collect_all("zh_core_web_md")` 将 spaCy 及其中文模型整体卷进 exe，
+> 因此最终用户无需单独安装；体积相应增大（约 +150~200 MB），属预期内。
 
 ## 目录结构
 
