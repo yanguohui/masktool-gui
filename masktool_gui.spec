@@ -4,14 +4,19 @@ PyInstaller .spec
 =================
 
 直接双击运行 build.bat 即可调用 PyInstaller；这里保留 .spec 以便二次定制。
+也支持在 macOS/Linux 上直接运行：
+    python -m PyInstaller --noconfirm --clean masktool_gui.spec
 """
 
+import sys
 from pathlib import Path
 
 ROOT = Path(SPECPATH)
 ASSETS = ROOT / "assets"
 ICON = ASSETS / "app.ico"
+ICON_MAC = ASSETS / "app.icns"  # macOS 建议提供 .icns 图标
 CONFIG_DIR = ASSETS / "mask_tool_config"
+IS_MAC = sys.platform == "darwin"
 
 block_cipher = None
 
@@ -121,10 +126,22 @@ exe = EXE(
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
-    argv_emulation=False,
+    # macOS .app 需要参数模拟，否则双击启动时 sys.argv 会异常
+    argv_emulation=IS_MAC,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(ICON) if ICON.is_file() else None,
+    icon=str(ICON_MAC if IS_MAC and ICON_MAC.is_file() else ICON)
+    if (ICON_MAC.is_file() if IS_MAC else ICON.is_file())
+    else None,
     version=str(ASSETS / "version.txt") if (ASSETS / "version.txt").is_file() else None,
 )
+
+# macOS 上额外生成 .app bundle，用户双击即可运行
+if IS_MAC:
+    app = BUNDLE(
+        exe,
+        name="本地文档脱敏工具.app",
+        icon=str(ICON_MAC) if ICON_MAC.is_file() else None,
+        bundle_identifier="com.yanguohui.masktool-gui",
+    )

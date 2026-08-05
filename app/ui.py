@@ -39,18 +39,39 @@ APP_TITLE = "本地文档脱敏工具"
 APP_VERSION = "1.0.0"
 
 IS_WINDOWS = os.name == "nt"
+IS_FROZEN = bool(getattr(sys, "frozen", False))
 
-INSTALL_HELP = (
-    "未检测到脱敏核心 mask-tool。\n\n"
-    "请按以下步骤安装（只需一次）：\n"
-    "  1. 安装 Python 3.10 及以上版本，安装时勾选 “Add Python to PATH”\n"
-    "  2. 下载 mask-tool 源码：\n"
-    "     git clone https://github.com/ZagooYWX/mask-tool.git\n"
-    "  3. 进入目录执行：\n"
-    "     pip install -e .\n\n"
-    "安装完成后点击“重新检测”。\n"
-    "若已安装但仍无法识别，可点击“手动指定…”选择 mask-tool 可执行文件。"
-)
+
+def _install_help(detail: str = "") -> str:
+    """根据运行形态生成 mask-tool 缺失时的提示文案。"""
+    if IS_FROZEN:
+        # 打包后的单文件程序应当自带 mask-tool；若仍检测不到，通常是构建遗漏。
+        msg = (
+            "未检测到脱敏核心 mask-tool。\n\n"
+            "本程序为打包版本，理论上已内置 mask-tool，"
+            "若出现此提示，说明当前安装包不完整或构建异常。\n"
+            "建议操作：\n"
+            "  1. 重新下载官方发布的安装包/可执行文件；\n"
+            "  2. 若您是从源码自行打包，请确认 requirements.txt 中的 mask-tool 已安装，"
+            "并重新执行 PyInstaller 打包；\n"
+            "  3. 亦可点击“手动指定…”选择 mask-tool 可执行文件（高级）。"
+        )
+    else:
+        # 源码/开发运行：需要自行安装 mask-tool
+        msg = (
+            "未检测到脱敏核心 mask-tool。\n\n"
+            "请按以下步骤安装（只需一次）：\n"
+            "  1. 安装 Python 3.10 及以上版本，安装时勾选 “Add Python to PATH”\n"
+            "  2. 下载 mask-tool 源码：\n"
+            "     git clone https://github.com/ZagooYWX/mask-tool.git\n"
+            "  3. 进入目录执行：\n"
+            "     pip install -e .\n\n"
+            "安装完成后点击“重新检测”。\n"
+            "若已安装但仍无法识别，可点击“手动指定…”选择 mask-tool 可执行文件。"
+        )
+    if detail:
+        msg += f"\n\n诊断信息：\n{detail}"
+    return msg
 
 # 用户词库类别：界面中文标签 -> mask-tool 词库类别键
 LEX_CATEGORIES = [
@@ -1236,7 +1257,7 @@ class MaskApp:
         self.pb.configure(maximum=len(self.files), value=0)
 
         if self.tool is None:
-            messagebox.showerror("缺少脱敏核心", INSTALL_HELP)
+            messagebox.showerror("缺少脱敏核心", _install_help())
             return
 
         # 用当前用户词库重建引擎（词库改动实时生效）
@@ -1316,7 +1337,7 @@ class MaskApp:
             self.btn_detect.configure(state="normal")
             self.btn_run.configure(state="disabled")
             self.lbl_status.configure(text="请先安装脱敏核心")
-            messagebox.showerror("缺少脱敏核心", INSTALL_HELP)
+            messagebox.showerror("缺少脱敏核心", _install_help(payload))
 
         elif kind == "progress":
             i, n, p = payload

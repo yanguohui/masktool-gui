@@ -1696,23 +1696,28 @@ def _probe_version(argv: list[str]) -> str:
 def locate_mask_tool(manual_path: str | None = None) -> ToolInfo:
     """多级回退定位 mask-tool。
 
-    顺序：用户手动指定 → PATH → 常见 Scripts 目录 → ``python -m mask_tool``。
+    顺序：用户手动指定 → PATH → 常见 Scripts 目录 → ``python -m mask_tool`` →
+    当前进程内导入。
 
     Raises:
         MaskToolNotFound: 全部候选都不可用。
     """
-    # 0) 冻结（打包）模式：mask-tool 已内嵌，直接进程内调用验证可用性
+    tried: list[str] = []
+
+    # 0) 冻结（打包）模式：mask-tool 应已内嵌，直接进程内调用验证可用性。
+    #    这里除了导入顶层包，还要确认核心处理链路存在，避免空壳包被误判。
     if IS_FROZEN:
         try:
             import importlib
             mt = importlib.import_module("mask_tool")
+            importlib.import_module("mask_tool.core.pipeline")
+            importlib.import_module("mask_tool.models.config")
             ver = str(getattr(mt, "__version__", ""))
             return ToolInfo(["(内嵌进程调用)"], "已内嵌于程序", ver)
-        except Exception:
-            # 极端情况下未打包成功，继续走下面的回退（基本都会失败）
-            pass
-
-    tried: list[str] = []
+        except Exception as exc:
+            # 打包后仍找不到，大概率是构建遗漏；把原因记下来，同时继续
+            # 尝试外部回退（虽然通常都会失败，但可给用户更具体的提示）。
+            tried.append(f"程序内嵌的 mask-tool 无法加载：{exc}")
 
     # 1) 用户手动指定
     if manual_path:
@@ -1756,9 +1761,10 @@ def locate_mask_tool(manual_path: str | None = None) -> ToolInfo:
     try:
         import importlib
         importlib.import_module("mask_tool")
+        importlib.import_module("mask_tool.core.pipeline")
         return ToolInfo(["(内嵌进程调用)"], "已安装 mask_tool（进程内调用）", "")
-    except Exception:
-        pass
+    except Exception as exc:
+        tried.append(f"当前 Python 环境无法导入 mask_tool：{exc}")
 
     detail = "\n".join(f"  · {t}" for t in tried)
     raise MaskToolNotFound(detail)

@@ -1,0 +1,74 @@
+name: Build macOS App
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout GUI repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build icon and App
+        run: |
+          python -m venv build-venv
+          source build-venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python tools/make_icon.py || true
+          python -m PyInstaller --noconfirm --clean masktool_gui.spec
+
+      - name: Verify app bundle structure
+        run: |
+          ls -la dist/
+          test -d "dist/本地文档脱敏工具.app" || exit 1
+
+      - name: Self-test (smoke)
+        run: |
+          source build-venv/bin/activate
+          # 生成一个临时测试 docx（python-docx 已由 mask-tool 依赖带入）
+          python - <<'PY'
+          from docx import Document
+          from pathlib import Path
+          doc = Document()
+          doc.add_paragraph("本文件用于构建自检，包含姓名张三、电话13800138000。")
+          Path("dist/test_input.docx").parent.mkdir(parents=True, exist_ok=True)
+          doc.save("dist/test_input.docx")
+          PY
+          # 运行自检；结果成功与否都先放行（CI 里不阻塞构建，仅做冒烟测试）
+          "dist/本地文档脱敏工具.app/Contents/MacOS/本地文档脱敏工具" \
+              --selftest dist/test_input.docx dist/test_output || true
+          ls -la dist/test_output || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 本地文档脱敏工具-macOS
+          path: dist/本地文档脱敏工具.app
+
+      - name: Create zip for release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cd dist
+          zip -r "本地文档脱敏工具-macOS.zip" "本地文档脱敏工具.app"
+
+      - name: Release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/本地文档脱敏工具-macOS.zip
+          generate_release_notes: true

@@ -130,18 +130,51 @@ def _png(pixels, size) -> bytes:
             + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
 
 
+def _icns(images: dict[int, bytes]) -> bytes:
+    """把尺寸 -> PNG 数据组装成 Apple .icns 文件（纯标准库）。"""
+    # (类型码, 逻辑尺寸, 实际像素尺寸)
+    entries = [
+        (b"icp4", 16, 16),
+        (b"icp5", 32, 32),
+        (b"icp6", 64, 64),
+        (b"ic07", 128, 128),
+        (b"ic08", 256, 256),
+        (b"ic09", 512, 512),
+        (b"ic10", 1024, 1024),
+        (b"ic11", 16, 32),   # 16@2x
+        (b"ic12", 32, 64),   # 32@2x
+        (b"ic13", 128, 256), # 128@2x
+        (b"ic14", 256, 512), # 256@2x
+    ]
+    blobs = b""
+    for type_code, _logical, actual in entries:
+        data = images.get(actual)
+        if not data:
+            continue
+        size = 8 + len(data)
+        blobs += type_code + struct.pack(">I", size) + data
+
+    total_size = 8 + len(blobs)
+    return b"icns" + struct.pack(">I", total_size) + blobs
+
+
 def main() -> None:
     base = render()
-    sizes = [16, 32, 48, 64, 128, 256]
-    images = [_png(base if s == W else _resize(base, s), s) for s in sizes]
+    ico_sizes = [16, 32, 48, 64, 128, 256]
+    icns_actual_sizes = [16, 32, 64, 128, 256, 512, 1024]
 
-    out = Path(__file__).resolve().parent.parent / "assets" / "app.ico"
-    out.parent.mkdir(parents=True, exist_ok=True)
+    ico_images = [_png(base if s == W else _resize(base, s), s) for s in ico_sizes]
+    icns_images = {s: _png(base if s == W else _resize(base, s), s) for s in icns_actual_sizes}
 
-    header = struct.pack("<HHH", 0, 1, len(images))
-    offset = 6 + 16 * len(images)
+    assets = Path(__file__).resolve().parent.parent / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+
+    # ---- .ico (Windows) ----
+    out_ico = assets / "app.ico"
+    header = struct.pack("<HHH", 0, 1, len(ico_images))
+    offset = 6 + 16 * len(ico_images)
     entries, blobs = b"", b""
-    for size, data in zip(sizes, images):
+    for size, data in zip(ico_sizes, ico_images):
         entries += struct.pack(
             "<BBBBHHII",
             0 if size >= 256 else size, 0 if size >= 256 else size,
@@ -149,9 +182,13 @@ def main() -> None:
         )
         blobs += data
         offset += len(data)
+    out_ico.write_bytes(header + entries + blobs)
+    print(f"已生成 {out_ico}  ({out_ico.stat().st_size / 1024:.1f} KB, {len(ico_sizes)} 种尺寸)")
 
-    out.write_bytes(header + entries + blobs)
-    print(f"已生成 {out}  ({out.stat().st_size / 1024:.1f} KB, {len(sizes)} 种尺寸)")
+    # ---- .icns (macOS) ----
+    out_icns = assets / "app.icns"
+    out_icns.write_bytes(_icns(icns_images))
+    print(f"已生成 {out_icns}  ({out_icns.stat().st_size / 1024:.1f} KB)")
 
 
 if __name__ == "__main__":
