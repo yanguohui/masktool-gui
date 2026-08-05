@@ -46,7 +46,7 @@ IS_WINDOWS = os.name == "nt"
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 
 #: mask-tool 支持的全部格式
-SUPPORTED_EXTS: tuple[str, ...] = (".docx", ".pdf", ".xlsx", ".pptx")
+SUPPORTED_EXTS: tuple[str, ...] = (".doc", ".docx", ".pdf", ".xlsx", ".pptx")
 
 #: 这些格式能真正产出"脱敏后的同类型文件"
 REWRITABLE_EXTS: tuple[str, ...] = (".docx", ".xlsx", ".pptx")
@@ -1827,6 +1827,95 @@ def build_output_name(src: Path, suffix_tag: str = "_脱敏") -> str:
 
 
 # --------------------------------------------------------------------------
+# 旧版 .doc 格式支持（借助 LibreOffice 转 docx 后走现有流程）
+# --------------------------------------------------------------------------
+
+def find_libreoffice() -> str | None:
+    """定位 LibreOffice 可执行文件（soffice / libreoffice）。
+
+    找不到返回 None。.doc 旧版 Word 需经 LibreOffice 转为 .docx 后才能交给
+    mask-tool 处理。
+    """
+    import shutil
+    for name in ("soffice", "libreoffice"):
+        p = shutil.which(name)
+        if p:
+            return p
+    candidates: list[str] = []
+    if IS_WINDOWS:
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        candidates = [
+            os.path.join(pf, "LibreOffice", "program", "soffice.exe"),
+            os.path.join(pf86, "LibreOffice", "program", "soffice.exe"),
+        ]
+    elif sys.platform == "darwin":
+        candidates = ["/Applications/LibreOffice.app/Contents/MacOS/soffice"]
+    else:
+        candidates = [
+            "/usr/bin/soffice", "/usr/bin/libreoffice",
+            "/opt/libreoffice/program/soffice",
+        ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _libreoffice_convert(soffice: str, src: Path, out_dir: Path, fmt: str) -> Path | None:
+    """用 LibreOffice 无头模式把 src 转为 fmt（docx / doc）。
+
+    返回产物路径，失败返回 None。每次调用使用独立临时配置目录，
+    避免与正在运行的 LibreOffice 实例争用锁。
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    profile = tempfile.mkdtemp(prefix="lo_profile_")
+    try:
+        cmd = [
+            soffice, "--headless", "--norestore", "--nofirststartwizard",
+            "--nologo",
+            f"-env:UserInstallation=file://{profile}",
+            "--convert-to", fmt, "--outdir", str(out_dir), str(src),
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+    expected = out_dir / f"{Path(src).stem}.{fmt}"
+    if expected.is_file():
+        return expected
+    cands = [f for f in out_dir.iterdir()
+             if f.is_file() and f.suffix.lower() == f".{fmt}"]
+    if cands:
+        cands.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        return cands[0]
+    return None
+
+
+def _convert_doc_to_docx(soffice: str, src: Path, work_dir: Path) -> Path | None:
+    return _libreoffice_convert(soffice, src, work_dir, "docx")
+
+
+def _convert_docx_to_doc(soffice: str, src_docx: Path, final_path: Path) -> Path | None:
+    """把脱敏后的 .docx 转回 .doc，落到 final_path。"""
+    tmp = Path(tempfile.mkdtemp(prefix="lo_docx2doc_"))
+    try:
+        converted = _libreoffice_convert(soffice, src_docx, tmp, "doc")
+        if converted is None:
+            return None
+        if final_path.exists():
+            final_path.unlink()
+        shutil.move(str(converted), str(final_path))
+        return final_path
+    except OSError:
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
 # 引擎
 # --------------------------------------------------------------------------
 
@@ -2024,6 +2113,13 @@ class MaskEngine:
         if mode not in MODES:
             mode = "smart"
 
+        # 旧版 .doc：mask-tool 无法直接读取，转 docx 处理后转回 .doc
+        if ext == ".doc":
+            return self._process_doc(
+                src, out_dir, mode, save_mapping, suffix_tag,
+                sensitivity, min_confidence, ner_backend, spacy_model,
+            )
+
         # 优先使用进程内调用（冻结打包后唯一可靠路径）
         if self._inproc is not None:
             return self._process_one_inproc(
@@ -2107,6 +2203,54 @@ class MaskEngine:
                 message=msg,
                 report_only=report_only,
             )
+
+    def _process_doc(self, src, out_dir, mode, save_mapping, suffix_tag,
+                    sensitivity, min_confidence, ner_backend, spacy_model):
+        """处理旧版 .doc：LibreOffice 转 docx -> 现有脱敏流程 -> 转回 .doc。"""
+        soffice = find_libreoffice()
+        if soffice is None:
+            return FileResult(
+                source=src, ok=False,
+                message="当前环境未检测到 LibreOffice，无法处理 .doc 旧版 Word 文件。"
+                        "请安装 LibreOffice 后重试，或先将文件另存为 .docx。",
+            )
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return FileResult(src, False,
+                              message=f"无法创建输出目录：{exc.strerror or exc}")
+
+        tmp_root = Path(tempfile.mkdtemp(prefix="masktool_doc_"))
+        try:
+            docx_src = _convert_doc_to_docx(soffice, src, tmp_root)
+            if docx_src is None:
+                return FileResult(
+                    src, False,
+                    message="将 .doc 转换为 .docx 失败（LibreOffice 转换异常或超时）。")
+
+            r = self.process_one(
+                docx_src, tmp_root / "masked", mode=mode,
+                save_mapping=False, suffix_tag=suffix_tag,
+                sensitivity=sensitivity, min_confidence=min_confidence,
+                ner_backend=ner_backend, spacy_model=spacy_model,
+            )
+            if not r.ok or r.output is None:
+                return FileResult(src, False, message=r.message or "脱敏处理未产生结果。")
+
+            final_doc = _unique_path(out_dir / build_output_name(src, suffix_tag))
+            if _convert_docx_to_doc(soffice, Path(r.output), final_doc) is None:
+                return FileResult(
+                    src, False,
+                    message="脱敏已成功，但将结果转回 .doc 失败（LibreOffice 转换异常）。")
+
+            return FileResult(
+                source=src, ok=True, output=final_doc, mapping=None,
+                masked_count=r.masked_count,
+                message=f"已脱敏 {r.masked_count} 项（.doc 经 LibreOffice 转 .docx 处理后再转回）",
+                report_only=False,
+            )
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
 
     def _process_one_inproc(
         self,

@@ -30,7 +30,7 @@ from app import settings
 from app.engine import (
     MODE_LABELS, MODES, REPORT_ONLY_EXTS, SUPPORTED_EXTS,
     SENSITIVITY_LEVELS, SENSITIVITY_KEYS, SENSITIVITY_DEFAULT,
-    FileResult, MaskEngine, MaskToolNotFound, ToolInfo, locate_mask_tool,
+    FileResult, MaskEngine, MaskToolNotFound, ToolInfo, locate_mask_tool, find_libreoffice,
     load_whitelist, save_whitelist,
     set_min_confidence, set_ner_backend, ner_status,
 )
@@ -290,7 +290,7 @@ class MaskApp:
 
         self.lbl_hint = ttk.Label(
             box,
-            text="支持 .docx / .pdf / .xlsx / .pptx；可一次添加多个文件批量处理",
+            text="支持 .doc / .docx / .pdf / .xlsx / .pptx；可一次添加多个文件批量处理（.doc 需安装 LibreOffice）",
             style="Hint.TLabel",
         )
         self.lbl_hint.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -673,6 +673,7 @@ class MaskApp:
             filetypes=[
                 ("支持的文档", pattern),
                 ("Word 文档", "*.docx"),
+                ("Word 97-2003 文档", "*.doc"),
                 ("PDF 文档", "*.pdf"),
                 ("Excel 工作簿", "*.xlsx"),
                 ("PowerPoint 演示文稿", "*.pptx"),
@@ -701,7 +702,7 @@ class MaskApp:
         if not found:
             messagebox.showinfo("没有找到文件",
                                 "该文件夹（含子目录）中没有可处理的文档。\n"
-                                "支持的格式：.docx / .pdf / .xlsx / .pptx")
+                                "支持的格式：.doc / .docx / .pdf / .xlsx / .pptx")
             return
         self._add(found)
 
@@ -709,6 +710,8 @@ class MaskApp:
         exist = {str(p) for p in self.files}
         skipped = 0
         added = 0
+        doc_without_lo = False
+        lo_ok = find_libreoffice() is not None
         for p in paths:
             if p.suffix.lower() not in SUPPORTED_EXTS:
                 skipped += 1
@@ -718,8 +721,14 @@ class MaskApp:
             self.files.append(p)
             exist.add(str(p))
             added += 1
-            tag = "warn" if p.suffix.lower() in REPORT_ONLY_EXTS else ""
-            note = "PDF 仅输出检测报告" if p.suffix.lower() in REPORT_ONLY_EXTS else ""
+            ext = p.suffix.lower()
+            if ext in REPORT_ONLY_EXTS:
+                tag, note = "warn", "PDF 仅输出检测报告"
+            elif ext == ".doc" and not lo_ok:
+                tag, note = "warn", "需 LibreOffice"
+                doc_without_lo = True
+            else:
+                tag, note = "", ""
             self.tree.insert("", "end", iid=str(p),
                              values=(p.name, human_size(p), "待处理", note),
                              tags=(tag,) if tag else ())
@@ -728,7 +737,13 @@ class MaskApp:
             messagebox.showwarning(
                 "部分文件已跳过",
                 f"有 {skipped} 个文件格式不受支持，已自动跳过。\n"
-                "仅支持 .docx / .pdf / .xlsx / .pptx",
+                "仅支持 .doc / .docx / .pdf / .xlsx / .pptx",
+            )
+        if doc_without_lo:
+            messagebox.showwarning(
+                "缺少 LibreOffice",
+                "你添加的 .doc 旧版 Word 文件需要 LibreOffice 才能处理。\n"
+                "请安装 LibreOffice（免费），或先将文件另存为 .docx 后再添加。",
             )
         if added:
             self.lbl_status.configure(text=f"已添加 {added} 个文件")
