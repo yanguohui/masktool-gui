@@ -439,11 +439,7 @@ class MaskApp:
         self._build_widgets()
         self._bind_events()
 
-        # 所有控件创建并布局完成后再去掉系统边框，避免子控件 pack 时窗口路径失效
-        try:
-            self.root.overrideredirect(True)
-        except Exception:
-            pass
+        # 窗口阴影在控件创建完成后再设置
         self._set_window_shadow()
 
         self.root.after(60, self._pump)
@@ -453,6 +449,12 @@ class MaskApp:
 
     def _build_window(self) -> None:
         self.root.title(APP_TITLE)
+
+        # 自定义标题栏：去掉系统边框（在设置 geometry 之前执行，确保尺寸生效）
+        try:
+            self.root.overrideredirect(True)
+        except Exception:
+            pass
 
         style = ttk.Style()
         try:
