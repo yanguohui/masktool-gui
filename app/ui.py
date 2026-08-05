@@ -222,8 +222,18 @@ class MaskApp:
 
     def _build_window(self) -> None:
         self.root.title(f"{APP_TITLE}  v{APP_VERSION}")
-        self.root.geometry("760x800")
-        self.root.minsize(700, 680)
+
+        # 根据平台与屏幕可用高度计算合适的默认尺寸。
+        # macOS 菜单栏+程序坞约占用 120px；Windows 任务栏约 80px。
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        reserve = 120 if sys.platform == "darwin" else 80
+        usable_h = max(screen_h - reserve, 640)
+
+        target_w = 800
+        target_h = min(900, usable_h)
+        self.root.geometry(f"{target_w}x{target_h}")
+        self.root.minsize(720, 700)
 
         style = ttk.Style()
         for theme in ("vista", "winnative", "clam"):
@@ -240,17 +250,71 @@ class MaskApp:
         style.configure("Err.TLabel", foreground="#c1121f")
         style.configure("Run.TButton", font=(fam, size, "bold"))
 
-        # 居中
+        # 居中（基于实际尺寸）
         self.root.update_idletasks()
-        w, h = 740, 660
-        x = (self.root.winfo_screenwidth() - w) // 2
-        y = (self.root.winfo_screenheight() - h) // 3
-        self.root.geometry(f"{w}x{h}+{max(x,0)}+{max(y,0)}")
+        w = max(self.root.winfo_width(), target_w)
+        h = max(self.root.winfo_height(), target_h)
+        x = (screen_w - w) // 2
+        y = (screen_h - h) // 3
+        self.root.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
 
     def _build_widgets(self) -> None:
         pad = {"padx": 10, "pady": 6}
-        outer = ttk.Frame(self.root, padding=(12, 10, 12, 10))
-        outer.pack(fill="both", expand=True)
+
+        # 主滚动容器：窗口高度不足时可通过滚动条/滚轮访问全部功能
+        self._canvas = tk.Canvas(self.root, highlightthickness=0)
+        self._vscroll = ttk.Scrollbar(
+            self.root, orient="vertical", command=self._canvas.yview
+        )
+        self._canvas.configure(yscrollcommand=self._vscroll.set)
+
+        self._vscroll.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        outer = ttk.Frame(self._canvas, padding=(12, 10, 12, 10))
+        self._outer_id = self._canvas.create_window(
+            (0, 0), window=outer, anchor="nw"
+        )
+
+        def _update_scroll(event=None):
+            self._canvas.update_idletasks()
+            bbox = self._canvas.bbox("all")
+            if not bbox:
+                return
+            self._canvas.configure(scrollregion=bbox)
+            canvas_h = self._canvas.winfo_height()
+            content_h = bbox[3] - bbox[1]
+            if content_h <= canvas_h:
+                self._vscroll.pack_forget()
+            else:
+                self._vscroll.pack(side="right", fill="y", before=self._canvas)
+
+        outer.bind("<Configure>", _update_scroll)
+        self._canvas.bind(
+            "<Configure>",
+            lambda e: (
+                self._canvas.itemconfig(self._outer_id, width=e.width),
+                _update_scroll(),
+            ),
+        )
+
+        # 鼠标滚轮：在 Treeview/Listbox/Combobox/Spinbox 等自带滚动的控件上不起作用
+        def _on_mousewheel(event):
+            widget_cls = event.widget.winfo_class()
+            if widget_cls in ("Treeview", "Listbox", "TCombobox", "TSpinbox", "Scrollbar"):
+                return
+            delta = 0
+            if event.num == 4 or getattr(event, "delta", 0) > 0:
+                delta = -1
+            elif event.num == 5 or getattr(event, "delta", 0) < 0:
+                delta = 1
+            if delta:
+                self._canvas.yview_scroll(delta, "units")
+
+        self._canvas.bind("<MouseWheel>", _on_mousewheel)
+        self._canvas.bind("<Button-4>", _on_mousewheel)
+        self._canvas.bind("<Button-5>", _on_mousewheel)
+
         outer.columnconfigure(0, weight=1)
         # 文件列表区域必须保留最小高度，避免选项区过多时被压成 0
         outer.rowconfigure(1, weight=1, minsize=140)
