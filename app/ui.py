@@ -446,11 +446,6 @@ class MaskApp:
 
     def _build_window(self) -> None:
         self.root.title(APP_TITLE)
-        # 自定义标题栏：去掉系统边框
-        try:
-            self.root.overrideredirect(True)
-        except Exception:
-            pass
 
         style = ttk.Style()
         try:
@@ -499,7 +494,6 @@ class MaskApp:
 
         self.root.geometry("940x960")
         self.root.minsize(820, 680)
-        self._set_window_shadow()
 
         # 居中
         self.root.update_idletasks()
@@ -507,6 +501,15 @@ class MaskApp:
         x = (self.root.winfo_screenwidth() - w) // 2
         y = max((self.root.winfo_screenheight() - h) // 3, 20)
         self.root.geometry(f"{w}x{h}+{max(x, 0)}+{y}")
+
+        # 自定义标题栏：去掉系统边框（在 WM 定位/尺寸设置完成后执行，避免 Windows 报错）
+        try:
+            self.root.overrideredirect(True)
+        except Exception:
+            pass
+
+        # Windows 阴影
+        self._set_window_shadow()
 
     def _set_window_shadow(self) -> None:
         """为无边框窗口添加轻微阴影（Windows）。"""
@@ -516,7 +519,10 @@ class MaskApp:
             import ctypes
             GCL_STYLE = -26
             CS_DROPSHADOW = 0x00020000
+            self.root.update_idletasks()
             hwnd = self.root.winfo_id()
+            if not hwnd:
+                return
             cur = ctypes.windll.user32.GetClassLongPtrW(hwnd, GCL_STYLE)
             ctypes.windll.user32.SetClassLongPtrW(
                 hwnd, GCL_STYLE, cur | CS_DROPSHADOW)
