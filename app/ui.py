@@ -260,8 +260,8 @@ class ModernButton(tk.Frame):
         w += self._padx * 2
         if self._width:
             w = max(w, self._width)
-        self._w = int(max(w, 44))
-        self._cv.configure(width=self._w, height=self._height)
+        self._btn_w = int(max(w, 44))
+        self._cv.configure(width=self._btn_w, height=self._height)
 
     def _base_colors(self):
         if self._variant == "primary":
@@ -282,13 +282,13 @@ class ModernButton(tk.Frame):
             if self._hover:
                 base = _darken(base, 0.10)
         r = self._radius
-        w = self._w * self._scale
+        w = self._btn_w * self._scale
         h = self._height * self._scale
-        x0 = (self._w - w) / 2
+        x0 = (self._btn_w - w) / 2
         y0 = (self._height - h) / 2
         rounded_rect(self._cv, x0, y0, x0 + w, y0 + h, r,
                      fill=base, outline=edge, width=1)
-        self._cv.create_text(self._w / 2, self._height / 2, text=self._label,
+        self._cv.create_text(self._btn_w / 2, self._height / 2, text=self._label,
                              font=BODY_FONT, fill=tcol, anchor="center")
 
     # -- 交互 ---------------------------------------------------------------
