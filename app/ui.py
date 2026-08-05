@@ -439,6 +439,13 @@ class MaskApp:
         self._build_widgets()
         self._bind_events()
 
+        # 所有控件创建并布局完成后再去掉系统边框，避免子控件 pack 时窗口路径失效
+        try:
+            self.root.overrideredirect(True)
+        except Exception:
+            pass
+        self._set_window_shadow()
+
         self.root.after(60, self._pump)
         self.detect_engine()
 
@@ -502,14 +509,6 @@ class MaskApp:
         y = max((self.root.winfo_screenheight() - h) // 3, 20)
         self.root.geometry(f"{w}x{h}+{max(x, 0)}+{y}")
 
-        # 自定义标题栏：去掉系统边框（在 WM 定位/尺寸设置完成后执行，避免 Windows 报错）
-        try:
-            self.root.overrideredirect(True)
-        except Exception:
-            pass
-
-        # Windows 阴影
-        self._set_window_shadow()
 
     def _set_window_shadow(self) -> None:
         """为无边框窗口添加轻微阴影（Windows）。"""
